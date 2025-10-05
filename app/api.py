@@ -1,7 +1,7 @@
 # app/api.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List, Literal
 import requests, re, json, unicodedata
@@ -117,6 +117,10 @@ def sanitize_filters(f: Dict | None) -> Dict:
 # -----------------------------------------------------------------------------
 
 app = FastAPI(title="RAG Pricing API", version="1.3.0")
+
+@app.options("/chat/stream")
+async def options_chat_stream():
+    return JSONResponse(status_code=200, content={"ok": True})
 
 origins = [
     "http://localhost:5173",  # tu frontend local
@@ -480,6 +484,110 @@ def with_meta(payload: dict, plan: Plan) -> dict:
     if "reply" in payload and "message" not in payload:
         payload["message"] = payload["reply"]
     return payload
+
+
+@app.post("/chat/stream", tags=["chat"])
+def chat_stream(req: ChatReq):
+    """
+    Versión streaming del /chat para frontends que esperan eventos en vivo (SSE).
+    Ahora soporta intents: lookup, list, count, aggregate, compare.
+    """
+    text = req.message.strip()
+    plan = _plan_from_llm(text) or Plan(
+        intent=_classify_intent_heuristic(text),
+        filters=sanitize_filters(_guess_filters(text))
+    )
+
+    def event_generator():
+        # Mensaje inicial para el frontend
+        # yield f"data: Procesando intención: {plan.intent}\n\n"
+
+        # === Intent: LOOKUP ===
+        if plan.intent == "lookup":
+            hits = retrieve(text, plan.filters or None)
+            if not hits:
+                yield "data: No tengo esa información en la base\n\n"
+                return
+            ctx = _build_ctx(hits, plan.top_k or 5)
+            prompt = _prompt_answer(text, ctx)
+            for chunk in llm.stream(prompt):
+                yield chunk
+            return
+
+        # === Intent: LIST ===
+        if plan.intent == "list":
+            items = list_by_filter(plan.filters or None, limit=plan.limit or 100)
+            if not items:
+                yield "data: No tengo esa información en la base\n\n"
+                return
+            yield f"data: Encontré {len(items)} producto(s):\n\n"
+            # Envía filas de forma incremental (para UX)
+            for h in items[: min(len(items), 50)]:
+                line = f"- {h['name']} ({h['brand']}) | {h['price']} {h['currency']} | {h['store']} | {h['country']}"
+                yield f"data: {line}\n\n"
+            return
+
+        # === Intent: COUNT ===
+        if plan.intent == "count":
+            items = list_by_filter(plan.filters or None, limit=1000)
+            yield f"data: Tengo {len(items)} registro(s) que cumplen ese filtro.\n\n"
+            return
+
+        # === Intent: AGGREGATE ===
+        if plan.intent == "aggregate":
+            if not plan.group_by:
+                nt = _norm(text)
+                if "tienda" in nt:
+                    plan.group_by = "store"
+                elif "categor" in nt:
+                    plan.group_by = "category"
+                elif "pais" in nt or "país" in nt:
+                    plan.group_by = "country"
+
+            result = aggregate_prices(plan.filters or None, by=plan.group_by)
+            groups = result.get("groups", [])
+            if not groups:
+                yield "data: No tengo esa información en la base\n\n"
+                return
+
+            yield f"data: Resumen por {plan.group_by}:\n\n"
+            for g in groups:
+                key = g.get(plan.group_by)
+                summary = ", ".join([f"{k}: {v}" for k, v in g.items() if k != plan.group_by])
+                yield f"data: {key}: {summary}\n\n"
+            return
+
+        # === Intent: COMPARE ===
+        if plan.intent == "compare":
+            if not (plan.product_name and plan.product_name_b):
+                yield "data: Necesito dos productos para comparar.\n\n"
+                return
+
+            hits_a = retrieve(plan.product_name, plan.filters or None)[:3]
+            hits_b = retrieve(plan.product_name_b, plan.filters or None)[:3]
+            if not hits_a or not hits_b:
+                yield "data: No tengo esa información en la base para comparar.\n\n"
+                return
+
+            ctx_lines = []
+            for h in hits_a[:2] + hits_b[:2]:
+                ctx_lines.append(
+                    f"[{h['product_id']}] {h['name']} | {h['price']} {h['currency']} | {h['store']} | {h['country']}"
+                )
+            prompt = (
+                "Compara SOLO los productos del CONTEXTO (precio y presentación). "
+                "Si no es concluyente, responde exactamente: 'No tengo esa información en la base'.\n"
+                "Responde en español y cita [product_id].\n\n"
+                f"CONTEXTO:\n{chr(10).join(ctx_lines)}\n\nPREGUNTA: {text}\nRESPUESTA:"
+            )
+            for chunk in llm.stream(prompt):
+                yield chunk
+            return
+
+        # === Fallback ===
+        yield "data: No tengo esa información en la base\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.post("/chat", tags=["chat"])
