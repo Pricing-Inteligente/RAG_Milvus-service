@@ -118,10 +118,16 @@ def sanitize_filters(f: Dict | None) -> Dict:
 
 app = FastAPI(title="RAG Pricing API", version="1.3.0")
 
+origins = [
+    "http://localhost:5173",  # tu frontend local
+    "http://127.0.0.1:5173",  # a veces Vite usa 127.0.0.1
+    "http://localhost:8080",  # Lovable local
+]
+
 # Ahora S.cors_origins ya es lista (gracias a settings.py)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=S.cors_origins or ["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
