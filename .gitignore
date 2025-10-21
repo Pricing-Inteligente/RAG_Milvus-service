@@ -1,1 +1,22 @@
+
+# Python
 .venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Logs
+logs/
+**/logs/**
+*.log
+app/logs/
+
+# Env
+.env
+.env.*
+
+# Docker/Milvus/MinIO runtime
+volumes/
+**/milvus/**/logs/**
+**/milvus/**/rdb_data*/
+**/milvus/**/rdb_data_meta_kv*/

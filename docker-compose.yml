@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   milvus-etcd:
     image: quay.io/coreos/etcd:v3.5.5
@@ -5,10 +7,10 @@ services:
     environment:
       - ETCD_NAME=etcd
       - ETCD_DATA_DIR=/etcd
-      # ✅ Escucha en todas las interfaces (dentro del contenedor)
+      # Escucha en todas las interfaces (dentro del contenedor)
       - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
       - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
-      # ✅ Anuncia URLs alcanzables dentro de la red de Docker
+      # Anuncia URLs alcanzables dentro de la red de Docker
       - ETCD_ADVERTISE_CLIENT_URLS=http://milvus-etcd:2379
       - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://milvus-etcd:2380
       # Mantenimiento recomendado
@@ -35,7 +37,7 @@ services:
   milvus:
     image: milvusdb/milvus:v2.3.16
     container_name: milvus-standalone
-    command: ["milvus", "run", "standalone"]  # 👈 clave para que arranque Milvus
+    command: ["milvus", "run", "standalone"]  # clave para que arranque Milvus
     environment:
       - ETCD_ENDPOINTS=milvus-etcd:2379
       - MINIO_ADDRESS=milvus-minio:9000
@@ -47,6 +49,19 @@ services:
     depends_on:
       - milvus-etcd
       - milvus-minio
+    networks: [milvus-net]
+    restart: unless-stopped
+
+  # --- Web UI para Milvus (Attu) ---
+  attu:
+    image: zilliz/attu:v2.6
+    container_name: attu
+    environment:
+      MILVUS_URL: milvus:19530        # 👈 apuntar al NOMBRE DEL SERVICIO, no al container_name
+    ports:
+      - "8000:3000"
+    depends_on:
+      - milvus                        # 👈 depende del servicio 'milvus'
     networks: [milvus-net]
     restart: unless-stopped
 

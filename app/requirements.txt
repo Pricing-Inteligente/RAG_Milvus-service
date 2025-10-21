@@ -5,5 +5,6 @@ fastapi==0.111.0
 uvicorn[standard]==0.30.0
 pydantic==2.8.2
 marshmallow>=3.13,<4
-environs>=10,<12
+environs
+numpy<2
 
