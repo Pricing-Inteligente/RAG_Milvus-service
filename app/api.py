@@ -273,6 +273,99 @@ def _filters_head(f: Dict) -> str:
             f"categoría: {f.get('category') or '-'} | "
             f"tienda: {f.get('store') or '-'}")
 
+# -----------------------------------------------------------------------------
+# Visualización — construcción de prompt para la API externa de gráficos
+# -----------------------------------------------------------------------------
+def _viz_title(filters: Dict, intent: str, group_by: str | None = None) -> str:
+    cat = (filters or {}).get("category") or "productos"
+    cty = (filters or {}).get("country")
+    sto = (filters or {}).get("store")
+    loc = f" en {cty}" if cty else ""
+    if intent == "aggregate":
+        gb = {"store": "tienda", "country": "país", "category": "categoría"}.get(group_by or "", "grupo")
+        return f"Precio promedio de {cat} por {gb}{loc}"
+    if intent == "compare":
+        return f"Comparativa de precios de {cat}{loc}"
+    if sto:
+        return f"Precio de {cat}{loc} ({sto})"
+    return f"Precio de {cat}{loc}"
+
+def _viz_prompt_from_rows(rows: List[Dict], filters: Dict, *, title: str | None = None,
+                          max_n: int = 8, label_priority: List[str] = ["brand","name"]) -> str:
+    """
+    Construye un prompt NL + dataset JSON para una barra simple (label vs price).
+    El front/servicio de charts puede entender 'label' como eje X y 'value' como eje Y.
+    """
+    if not rows:
+        return ""
+    data = []
+    for r in rows[:max_n]:
+        label = None
+        for k in label_priority:
+            v = (r.get(k) or "").strip()
+            if v: label = v; break
+        if not label:
+            label = (r.get("name") or r.get("brand") or r.get("store") or r.get("product_id"))
+        if r.get("price") is None:
+            continue
+        data.append({
+            "label": label,
+            "value": float(r["price"]),
+            "currency": r.get("currency"),
+            "store": r.get("store"),
+            "brand": r.get("brand"),
+            "country": r.get("country"),
+            "product_id": r.get("product_id"),
+        })
+    if not data:
+        return ""
+    title = title or _viz_title(filters, "lookup")
+    nl = (
+        f"Genera una gráfica de barras titulada '{title}'. "
+        "Eje X: 'label'. Eje Y: 'value' (precio). "
+        "Usa el campo 'currency' solo para rotular si aplica. "
+        "Muestra etiquetas con 'brand' y 'store' cuando existan. "
+        f"Datos (JSON): {json.dumps(data, ensure_ascii=False)}"
+    )
+    return nl
+
+def _viz_prompt_from_agg(agg: Dict, filters: Dict, *, group_by: str) -> str:
+    """
+    Para agregados: usa el promedio como valor principal y pasa min/max para tooltips.
+    Schema: [{label, value, min, max}]
+    """
+    groups = (agg or {}).get("groups") or []
+    if not groups:
+        return ""
+    data = [{
+        "label": str(g.get("group")),
+        "value": float(g.get("avg")) if g.get("avg") is not None else None,
+        "min": float(g.get("min")) if g.get("min") is not None else None,
+        "max": float(g.get("max")) if g.get("max") is not None else None,
+    } for g in groups if g.get("group") is not None]
+    data = [d for d in data if d["value"] is not None]
+    if not data:
+        return ""
+    title = _viz_title(filters, "aggregate", group_by=group_by)
+    nl = (
+        f"Genera una gráfica de barras titulada '{title}'. "
+        f"Eje X: '{group_by}'. Eje Y: 'value' (precio promedio). "
+        "Incluye bandas o tooltips con 'min' y 'max' si el sistema lo soporta. "
+        f"Datos (JSON): {json.dumps(data, ensure_ascii=False)}"
+    )
+    return nl
+
+def _maybe_viz_prompt(intent: str, filters: Dict, *, rows: List[Dict] | None = None,
+                      agg: Dict | None = None, group_by: str | None = None) -> str | None:
+    try:
+        if intent in ("lookup", "list", "compare") and rows:
+            return _viz_prompt_from_rows(rows, filters)
+        if intent == "aggregate" and agg and (agg.get("groups") or []):
+            gb = group_by or "category"
+            return _viz_prompt_from_agg(agg, filters, group_by=gb)
+    except Exception:
+        return None
+    return None
 
 
 
@@ -1032,6 +1125,14 @@ def chat_stream(req: ChatReqStream):
             return StreamingResponse(_sse_no_data(), media_type="text/event-stream")
 
         def gen():
+            # --- VIZ_PROMPT ---
+            try:
+                vizp = _maybe_viz_prompt("list", plan.filters or {}, rows=rows)
+            except NameError:
+                vizp = None
+            if vizp:
+                yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+
             yield f"data: {_filters_head(plan.filters)}\n\n"
             yield f"data: Encontré {len(rows)} producto(s). Mostrando los primeros 10:\n\n"
             for i, r in enumerate(rows[:10], start=1):
@@ -1084,6 +1185,31 @@ def chat_stream(req: ChatReqStream):
 
                 # Stream determinista (sin LLM), SOLO columnas permitidas
                 def gen():
+                    # --- VIZ_PROMPT agregado por país (avg/min/max) ---
+                    try:
+                        groups = []
+                        for c, rows in with_data:
+                            prices = [r.get("price") for r in rows if r.get("price") is not None]
+                            if not prices:
+                                continue
+                            groups.append({
+                                "group": c,
+                                "avg": sum(prices) / max(len(prices), 1),
+                                "min": min(prices),
+                                "max": max(prices),
+                            })
+                        agg_for_viz = {"groups": groups}
+                        vizp = _maybe_viz_prompt(
+                            "aggregate",
+                            {"category": cat, "country": [c for c, _ in with_data]},
+                            agg=agg_for_viz,
+                            group_by="country",
+                        )
+                    except NameError:
+                        vizp = None
+                    if vizp:
+                        yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+
                     head = " | ".join(countries)
                     yield f"data: Filtros → categoría: {cat} | países: {head} | tienda: -\n\n"
                     if without_data:
@@ -1116,6 +1242,14 @@ def chat_stream(req: ChatReqStream):
                 return StreamingResponse(_sse_no_data(), media_type="text/event-stream")
 
             def gen_single():
+                # --- VIZ_PROMPT con los 2 primeros resultados ---
+                try:
+                    vizp = _maybe_viz_prompt("compare", plan.filters or {}, rows=hits[:2])
+                except NameError:
+                    vizp = None
+                if vizp:
+                    yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+
                 yield f"data: Filtros → país: {(plan.filters or {}).get('country') or '-'} | categoría: {(plan.filters or {}).get('category') or '-'} | tienda: {(plan.filters or {}).get('store') or '-'}\n\n"
                 yield "data: Comparativa simple (primeros 2 resultados):\n\n"
                 for i, h in enumerate(hits[:2], start=1):
@@ -1152,6 +1286,14 @@ def chat_stream(req: ChatReqStream):
         prompt = (f"Eres {ASSISTANT_NAME}. Redacta en 2–4 frases un resumen del agregado (JSON): {ctx}. "
                   "No inventes valores no listados.")
         def gen():
+            # --- VIZ_PROMPT del agregado ---
+            try:
+                vizp = _maybe_viz_prompt("aggregate", plan.filters or {}, agg=agg, group_by=plan.group_by or "category")
+            except NameError:
+                vizp = None
+            if vizp:
+                yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+
             yield f"data: {_filters_head(plan.filters)}\n\n"
             for chunk in llm_chat.stream(prompt):
                 yield chunk
@@ -1182,10 +1324,19 @@ def chat_stream(req: ChatReqStream):
     prompt = _prompt_answer_friendly(text, ctx)
 
     def gen_lookup():
+        # --- VIZ_PROMPT con los hits hallados ---
+        try:
+            vizp = _maybe_viz_prompt("lookup", plan.filters or {}, rows=hits)
+        except NameError:
+            vizp = None
+        if vizp:
+            yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+
         yield f"data: {_filters_head(plan.filters)}\n\n"
         for chunk in llm_chat.stream(prompt):
             yield chunk
     return StreamingResponse(gen_lookup(), media_type="text/event-stream")
+
 
 
 # -----------------------------------------------------------------------------

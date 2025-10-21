@@ -1,0 +1,10 @@
+services:
+  milvus-etcd:
+    volumes: []
+
+  milvus-minio:
+    volumes: []
+    command: ["server", "/minio_data"]
+
+  milvus-standalone:
+    volumes: []
