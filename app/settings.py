@@ -1,7 +1,7 @@
 # app/settings.py — Pydantic v2 compatible
 import os
 from functools import lru_cache
-from typing import List
+from typing import List, Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -27,18 +27,21 @@ class Settings(BaseSettings):
     # ¡IMPORTANTE! que coincida con tu colección
     vector_field: str = Field(default="vector", alias="VECTOR_FIELD")
 
-    metric_type: str = Field(default="IP", alias="METRIC_TYPE")  # ← usa IP (tu índice HNSW está en IP)
+    metric_type: str = Field(default="IP", alias="METRIC_TYPE")  # índice HNSW en IP
     nprobe: int = Field(default=16, alias="NPROBE")
 
     # ===== Modelos =====
     ollama_host: str = Field(default="http://127.0.0.1:11434", alias="OLLAMA_HOST")
 
     # Embeddings: "hf" o "ollama"
-    embed_backend: str = Field(default="hf", alias="EMBED_BACKEND")
+    embed_backend: Literal["hf","ollama"] = Field(default="hf", alias="EMBED_BACKEND")
     embed_model: str = Field(default="intfloat/multilingual-e5-base", alias="EMBED_MODEL")
 
-    # Generador
+    # Generador (lo que vamos a cambiar en los tests)
     gen_model: str = Field(default="phi3:mini", alias="GEN_MODEL")
+    gen_temperature: float = Field(default=0.35, alias="GEN_TEMPERATURE")
+    gen_num_ctx: int = Field(default=1024, alias="GEN_NUM_CTX")
+    gen_num_predict: int = Field(default=256, alias="GEN_NUM_PREDICT")
 
     # Umbral / TopK
     abstain_threshold: float = Field(default=0.35, alias="ABSTAIN_THRESHOLD")
@@ -90,4 +93,19 @@ def get_settings() -> Settings:
         s.abstention_threshold = s.abstain_threshold
     elif "ABSTENTION_THRESHOLD" in os.environ:
         s.abstain_threshold = s.abstention_threshold
+
+    # ---- Log útil al arrancar (para tus benchmarks) ----
+    print(
+        "[SETTINGS]"
+        f" GEN_MODEL={s.gen_model}"
+        f" | GEN_TEMPERATURE={s.gen_temperature}"
+        f" | GEN_NUM_CTX={s.gen_num_ctx}"
+        f" | GEN_NUM_PREDICT={s.gen_num_predict}"
+        f" | OLLAMA_HOST={s.ollama_host}"
+        f" | EMBED_BACKEND={s.embed_backend}"
+        f" | EMBED_MODEL={s.embed_model}"
+        f" | TOP_K={s.top_k}"
+        f" | ABSTAIN={s.abstain_threshold:.2f}"
+        f" | BM25_ENABLED={s.bm25_enabled}"
+    )
     return s
