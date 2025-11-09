@@ -1,6 +1,6 @@
 # app/retrieve.py — Recuperación híbrida (Milvus + BM25) con HF u Ollama para embeddings
 from __future__ import annotations
-import os, json, re, sqlite3
+import os, json, re, sqlite3, ast
 from typing import Dict, List, Optional, Tuple
 
 from settings import get_settings
@@ -17,7 +17,7 @@ def _milvus() -> Collection:
     alias = "default"
     if alias not in connections.list_connections():
         connections.connect(alias=alias, host=host, port=port)
-    col_name = getattr(S, "milvus_collection", "retail_products")
+    col_name = getattr(S, "milvus_collection", "products_latam")
     return Collection(col_name)
 
 # ---------- Embeddings ----------
@@ -66,7 +66,7 @@ def _embed(text: str) -> List[float]:
     return _embed_hf(text)
 
 # ---------- Campos ----------
-VECTOR_FIELD   = getattr(S, "vector_field", "vector")  # ¡coincide con la colección!
+VECTOR_FIELD   = getattr(S, "vector_field", "embedding")
 PK_FIELD       = getattr(S, "pk_field", "product_id")
 NAME_FIELD     = getattr(S, "name_field", "name")
 BRAND_FIELD    = getattr(S, "brand_field", "brand")
@@ -85,22 +85,65 @@ RETURN_FIELDS = [
     PRICE_FIELD, CURRENCY_FIELD, SIZE_FIELD, UNIT_FIELD, URL_FIELD, CANON_TEXT
 ]
 
+# ---------- País: permitir ISO2 o nombres en la BD ----------
+_COUNTRY_SYNONYMS = {
+    "AR": ["AR", "Argentina"],
+    "BR": ["BR", "Brasil", "Brazil"],
+    "CO": ["CO", "Colombia"],
+    "CR": ["CR", "Costa Rica"],
+    "MX": ["MX", "México", "Mexico"],
+    "PA": ["PA", "Panamá", "Panama"],
+    "PY": ["PY", "Paraguay"],
+    "PE": ["PE", "Perú", "Peru"],
+    "CL": ["CL", "Chile"],
+    "UY": ["UY", "Uruguay"],
+}
+def _expand_countries(value):
+    vals = value if isinstance(value, (list, tuple, set)) else [value]
+    out = []
+    for v in vals:
+        key = str(v).upper()
+        out.extend(_COUNTRY_SYNONYMS.get(key, [v]))
+    # dedup preservando orden
+    seen, res = set(), []
+    for v in out:
+        if v not in seen:
+            seen.add(v); res.append(v)
+    return res
+
 # ---------- Utils ----------
 def _norm(s: str) -> str:
     import unicodedata
     return "".join(c for c in unicodedata.normalize("NFD", s.lower())
                    if unicodedata.category(c) != "Mn")
 
+def _as_list_maybe(val):
+    """Acepta 'CO' | ['CO','BR'] | "['CO','BR']" y devuelve lista normalizada."""
+    if val is None:
+        return None
+    if isinstance(val, (list, tuple, set)):
+        return [x for x in val if x not in (None, "", "null")]
+    if isinstance(val, str):
+        s = val.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                arr = ast.literal_eval(s)
+                return [x for x in arr if x not in (None, "", "null")]
+            except Exception:
+                return [s]
+        return [s]
+    return [val]
+
 def _milvus_expr(filters: Optional[Dict]) -> Optional[str]:
     """
     Construye una expresión Milvus válida, soportando valores str o lista.
     Omite campos vacíos/None. Para listas usa 'in [..]'.
+    Además, expande país a sinónimos (ISO2 + nombres).
     """
     if not filters:
         return None
 
     def _lit(x):
-        # Literal para expr de Milvus
         if isinstance(x, str):
             return '"' + x.replace('"', '\\"') + '"'
         return str(x)
@@ -108,7 +151,6 @@ def _milvus_expr(filters: Optional[Dict]) -> Optional[str]:
     def _mk(field_name: str, value) -> Optional[str]:
         if value is None:
             return None
-        # Normaliza listas: quita None/"" y dedup
         if isinstance(value, (list, tuple, set)):
             vals = [v for v in value if v not in (None, "", "null")]
             if not vals:
@@ -118,7 +160,6 @@ def _milvus_expr(filters: Optional[Dict]) -> Optional[str]:
                 v = vals[0]
                 return f'{field_name} == {_lit(v)}'
             return f'{field_name} in [{", ".join(_lit(v) for v in vals)}]'
-        # Valor escalar
         if isinstance(value, str):
             v = value.strip()
             if not v:
@@ -126,22 +167,23 @@ def _milvus_expr(filters: Optional[Dict]) -> Optional[str]:
             return f'{field_name} == {_lit(v)}'
         return f'{field_name} == {value}'
 
+    # Expandir país: acepta lista o string con pinta de lista
+    if filters.get("country"):
+        filters = dict(filters)  # no mutar el original
+        c_list = _as_list_maybe(filters["country"])
+        filters["country"] = _expand_countries(c_list)
+
     exprs = []
     expr = _mk(COUNTRY_FIELD,  filters.get("country"))
-    if expr:
-        exprs.append(expr)
+    if expr: exprs.append(expr)
     expr = _mk(CAT_FIELD,      filters.get("category"))
-    if expr:
-        exprs.append(expr)
+    if expr: exprs.append(expr)
     expr = _mk(STORE_FIELD,    filters.get("store"))
-    if expr:
-        exprs.append(expr)
+    if expr: exprs.append(expr)
     expr = _mk(BRAND_FIELD,    filters.get("brand"))
-    if expr:
-        exprs.append(expr)
+    if expr: exprs.append(expr)
 
     return " and ".join(exprs) if exprs else None
-
 
 def _entity_get(entity, field: str):
     """Compat para PyMilvus Hit.entity: get(field) sin default; fallback a indexing."""
@@ -165,6 +207,12 @@ def _fts_conn() -> Optional[sqlite3.Connection]:
     except Exception:
         return None
 
+def _first_scalar(v):
+    """Para FTS/BM25: si el filtro viene como lista, toma el primero."""
+    if isinstance(v, (list, tuple, set)):
+        return next(iter(v), None)
+    return v
+
 def _bm25_search_sqlite(query: str, filters: Optional[Dict], top_k: int=50) -> List[Tuple[str, float]]:
     conn = _fts_conn()
     if not conn:
@@ -175,10 +223,14 @@ def _bm25_search_sqlite(query: str, filters: Optional[Dict], top_k: int=50) -> L
         return []
     where = " text MATCH ? "; args = [q]
     if filters:
-        if filters.get("country"):  where += " AND country = ?";  args.append(filters["country"])
-        if filters.get("category"): where += " AND category = ?"; args.append(filters["category"])
-        if filters.get("store"):    where += " AND store = ?";    args.append(filters["store"])
-        if filters.get("brand"):    where += " AND brand = ?";    args.append(filters["brand"])
+        ctry = _first_scalar(filters.get("country"))
+        cat  = _first_scalar(filters.get("category"))
+        store= _first_scalar(filters.get("store"))
+        brand= _first_scalar(filters.get("brand"))
+        if ctry:  where += " AND country = ?";  args.append(ctry)
+        if cat:   where += " AND category = ?"; args.append(cat)
+        if store: where += " AND store = ?";    args.append(store)
+        if brand: where += " AND brand = ?";    args.append(brand)
     sql = f"""
         SELECT docid, bm25(products_fts) AS score
         FROM products_fts
@@ -208,6 +260,11 @@ def _load_corpus_cache() -> List[Dict]:
     _CORPUS_CACHE = items
     return _CORPUS_CACHE
 
+def _match_val(doc_v, flt_v):
+    if isinstance(flt_v, (list, tuple, set)):
+        return doc_v in flt_v
+    return doc_v == flt_v
+
 def _bm25_search_fallback(query: str, filters: Optional[Dict], top_k: int=50) -> List[Tuple[str, float]]:
     docs = _load_corpus_cache()
     if not docs:
@@ -219,10 +276,14 @@ def _bm25_search_fallback(query: str, filters: Optional[Dict], top_k: int=50) ->
     scored = []
     for d in docs:
         if filters:
-            if filters.get("country") and d.get(COUNTRY_FIELD) != filters["country"]:  continue
-            if filters.get("category") and d.get(CAT_FIELD) != filters["category"]:    continue
-            if filters.get("store") and d.get(STORE_FIELD) != filters["store"]:        continue
-            if filters.get("brand") and d.get(BRAND_FIELD) != filters["brand"]:        continue
+            ctry = filters.get("country")
+            cat  = filters.get("category")
+            store= filters.get("store")
+            brand= filters.get("brand")
+            if ctry  and not _match_val(d.get(COUNTRY_FIELD), ctry): continue
+            if cat   and not _match_val(d.get(CAT_FIELD),      cat):  continue
+            if store and not _match_val(d.get(STORE_FIELD),    store):continue
+            if brand and not _match_val(d.get(BRAND_FIELD),    brand):continue
         text = " ".join([str(d.get(NAME_FIELD,"")), str(d.get(BRAND_FIELD,"")), str(d.get(CAT_FIELD,"")), str(d.get(STORE_FIELD,""))])
         ntxt = _norm(text)
         tf = sum(ntxt.count(tok) for tok in tokens)
@@ -242,22 +303,9 @@ def _dense_search(query: str, filters: Optional[Dict], top_k: int = 50) -> List[
     if not vec:
         return []
     col = _milvus()
+    col.load()
 
-    # Validación de dimensión
-    dim = 0
-    try:
-        for f in col.schema.fields:
-            if f.name == VECTOR_FIELD and hasattr(f, "params") and isinstance(f.params, dict):
-                dim = int(f.params.get("dim") or f.params.get("max_length") or 0)
-                break
-    except Exception:
-        dim = 0
-    if dim and len(vec) != dim:
-        return []
-
-    expr = _milvus_expr(filters)
-
-    # Autodetectar la métrica real del índice del campo vector (a prueba de config)
+    # Descubrir métrica del índice (antes de loggear)
     metric = getattr(S, "metric_type", "IP")
     try:
         for idx in col.indexes:
@@ -273,20 +321,111 @@ def _dense_search(query: str, filters: Optional[Dict], top_k: int = 50) -> List[
     except Exception:
         pass
 
+    # Validación de dimensión
+    dim = 0
     try:
+        for f in col.schema.fields:
+            if f.name == VECTOR_FIELD and hasattr(f, "params") and isinstance(f.params, dict):
+                dim = int(f.params.get("dim") or f.params.get("max_length") or 0)
+                break
+    except Exception:
+        dim = 0
+    if dim and len(vec) != dim:
+        # log dimension mismatch
+        try:
+            os.makedirs("logs", exist_ok=True)
+            with open("logs/retrieve.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "kind": "dim_mismatch", "expected": dim, "got": len(vec),
+                    "collection": col.name, "vector_field": VECTOR_FIELD
+                }) + "\n")
+        except Exception:
+            pass
+        return []
+
+    # Expr final (con expansión de país)
+    expr = _milvus_expr(filters)
+
+    # --- Pre-chequeos: ¿qué filtro está vaciando el conjunto? ---
+    has_country = has_category = has_both = False
+    try:
+        if filters and filters.get("country"):
+            expr_country = _milvus_expr({"country": filters.get("country")})
+            rows = col.query(expr=expr_country, output_fields=[PK_FIELD], limit=1)
+            has_country = len(rows) > 0
+    except Exception:
+        pass
+    try:
+        if filters and filters.get("category"):
+            expr_category = _milvus_expr({"category": filters.get("category")})
+            rows = col.query(expr=expr_category, output_fields=[PK_FIELD], limit=1)
+            has_category = len(rows) > 0
+    except Exception:
+        pass
+    try:
+        if expr:
+            rows = col.query(expr=expr, output_fields=[PK_FIELD], limit=1)
+            has_both = len(rows) > 0
+    except Exception:
+        pass
+
+    # Log de pre-chequeo
+    try:
+        os.makedirs("logs", exist_ok=True)
+        with open("logs/retrieve.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "kind": "dense_precheck",
+                "collection": col.name,
+                "metric": metric,
+                "dim": len(vec),
+                "query": query,
+                "filters_in": filters,
+                "expr_final": expr,
+                "has_country": has_country,
+                "has_category": has_category,
+                "has_both": has_both
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+    # Relajar categoría si país tiene datos pero la intersección queda vacía
+    if (filters and filters.get("category")
+        and has_country and not has_both):
+        relaxed = dict(filters)
+        relaxed.pop("category", None)
+        expr = _milvus_expr(relaxed)
+        try:
+            with open("logs/retrieve.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "kind": "dense_relax_category", "relaxed_expr": expr,
+                    "relaxed_filters": relaxed
+                }, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    # --- Búsqueda vectorial ---
+    try:
+        # Usa ef para HNSW y nprobe para IVF/IVF_FLAT
+        index_type = str(getattr(S, "index_type", "")).upper()  # pon "HNSW" en .env si aplica
+        if index_type == "HNSW":
+            search_param = {"metric_type": metric, "params": {"ef": int(getattr(S, "ef_search", 96))}}
+        else:
+            search_param = {"metric_type": metric, "params": {"nprobe": int(getattr(S, "nprobe", 48))}}
+
         res = col.search(
             data=[vec],
             anns_field=VECTOR_FIELD,
-            param={"metric_type": metric, "params": {"nprobe": int(getattr(S, "nprobe", 16))}},
+            param=search_param,
             limit=top_k,
             expr=expr,
-            output_fields=RETURN_FIELDS,
+            output_fields=RETURN_FIELDS
         )
+
     except Exception:
         return []
 
     out = []
-    # Para L2, menor distancia = mejor; para IP/COSINE, mayor = mejor. Para mantener “score” homogéneo, invertimos L2.
+    # Para L2, menor distancia = mejor; para IP/COSINE, mayor = mejor. Invertimos L2 para homogeneizar “score”.
     invert = (metric.upper() == "L2")
     for h in res[0]:
         drow = {}
@@ -295,6 +434,17 @@ def _dense_search(query: str, filters: Optional[Dict], top_k: int = 50) -> List[
         raw = float(h.distance)
         drow["_score"] = (-raw if invert else raw)
         out.append(drow)
+
+    # Log de hits
+    try:
+        with open("logs/retrieve.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "kind":"dense_hits","count": len(out),
+                "sample_ids":[d.get(PK_FIELD) for d in out[:5]]
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
     return out
 
 # ---------- Fetch ----------
@@ -338,6 +488,7 @@ def _rrf_merge(
     w_bm25: float = 1.0,
     final_top_k: int = 10
 ) -> List[Tuple[str, float]]:
+
     ranks_dense = {pid: i for i, (pid, _) in enumerate(dense, start=1)}
     ranks_bm25  = {pid: i for i, (pid, _) in enumerate(bm25,  start=1)}
     pids = set(ranks_dense) | set(ranks_bm25)
@@ -395,16 +546,20 @@ def retrieve(query: str, filters: Optional[Dict]=None) -> List[Dict]:
     if filters is None:
         filters = {}
 
+    # ⚠️ No infieras categoría cuando la consulta sea genérica (“precios” + “productos”)
+    ntq = _norm(query)
+    is_generic = (("precio" in ntq or "precios" in ntq) and ("producto" in ntq or "productos" in ntq))
+
     # 1) Sinónimos rápidos (determinista)
-    if "category" not in filters or not filters.get("category"):
+    if not is_generic and ("category" not in filters or not filters.get("category")):
         inferred = detect_category(query)
         if inferred:
             filters["category"] = inferred
 
     # 2) Fallback semántico por embeddings si aún no hay categoría
-    if "category" not in filters or not filters.get("category"):
+    if not is_generic and ("category" not in filters or not filters.get("category")):
         cat_sem, score_sem, _ = resolve_category_semantic(
-            query, min_cosine=float(getattr(S, "category_min_cosine", 0.45))
+            query, min_cosine=float(getattr(S, "category_min_cosine", 0.60))
         )
         if cat_sem:
             filters["category"] = cat_sem
@@ -443,7 +598,7 @@ def retrieve(query: str, filters: Optional[Dict]=None) -> List[Dict]:
         order = {pid: i for i, (pid, _) in enumerate(rr)}
         pairs_full.sort(key=lambda x: order.get(x[0], 1e9))
 
-    # 6) Armar salida final con score de fusión
+    # 6) Salida final con score de fusión
     score_by = {pid: s for pid, s in fused}
     out = []
     for pid, d in pairs_full[:final_k]:
@@ -454,6 +609,7 @@ def retrieve(query: str, filters: Optional[Dict]=None) -> List[Dict]:
 
 def list_by_filter(filters: Optional[Dict]=None, limit: int=100) -> List[Dict]:
     col = _milvus()
+    col.load()
     expr = _milvus_expr(filters)
     try:
         ret = col.query(expr=expr, output_fields=RETURN_FIELDS, limit=limit)
@@ -500,6 +656,7 @@ def aggregate_prices(filters: Optional[Dict]=None, by: Optional[str]=None) -> Di
     for k, g in groups.items():
         n = counts[k]
         g["avg"] = g["avg"] / max(n, 1)
+        g["n"] = n
         out.append(g)
     out.sort(key=lambda x: x["group"])
     return {"groups": out}

@@ -35,7 +35,7 @@ def _milvus_col() -> Collection:
     alias = "default"
     if alias not in connections.list_connections():
         connections.connect(alias=alias, host=host, port=port)
-    return Collection(getattr(S, "milvus_collection", "retail_products"))
+    return Collection(getattr(S, "milvus_collection", "products_latam"))
 
 def list_distinct_categories(limit: int = 1000) -> List[str]:
     """Obtiene las categorías distintas presentes en la colección (best-effort)."""
@@ -45,7 +45,7 @@ def list_distinct_categories(limit: int = 1000) -> List[str]:
     cats = sorted({r.get(getattr(S,"category_field","category")) for r in rows if r.get(getattr(S,"category_field","category"))})
     return cats
 
-def resolve_category_semantic(query: str, cats: Optional[List[str]] = None, min_cosine: float = 0.35) -> Tuple[Optional[str], float, Dict[str,float]]:
+def resolve_category_semantic(query: str, cats: Optional[List[str]] = None, min_cosine: float = None) -> Tuple[Optional[str], float, Dict[str,float]]:
     """Devuelve (categoria, score, scores_por_categoria). Usa cosine con E5."""
     cats = cats or list_distinct_categories()
     if not cats: 
@@ -57,6 +57,13 @@ def resolve_category_semantic(query: str, cats: Optional[List[str]] = None, min_
     best_cat = cats[best_idx]
     best_score = float(scores[best_idx].item())
     details = {cats[i]: float(scores[i].item()) for i in range(len(cats))}
+
+    if min_cosine is None:
+        from settings import get_settings
+        _S = get_settings()
+        min_cosine = float(getattr(_S, "category_min_cosine", 0.60))
+
+
     if best_score < min_cosine:
         return (None, best_score, details)
     return (best_cat, best_score, details)

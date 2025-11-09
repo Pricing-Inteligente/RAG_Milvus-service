@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     # ===== API =====
     api_host: str = Field(default="127.0.0.1", alias="API_HOST")
     api_port: int = Field(default=8000, alias="API_PORT")
+    chat_list_max: int = Field(default=3000, alias="CHAT_LIST_MAX")
 
     # CORS
     cors_origins: List[str] = Field(
@@ -21,7 +22,7 @@ class Settings(BaseSettings):
     # ===== Milvus =====
     milvus_host: str = Field(default="127.0.0.1", alias="MILVUS_HOST")
     milvus_port: int = Field(default=19530, alias="MILVUS_PORT")
-    milvus_collection: str = Field(default="retail_products", alias="MILVUS_COLLECTION")
+    milvus_collection: str = Field(default="products_latam", alias="MILVUS_COLLECTION")
     milvus_dim: int = Field(default=768, alias="MILVUS_DIM")
 
     # ¡IMPORTANTE! que coincida con tu colección
@@ -42,6 +43,8 @@ class Settings(BaseSettings):
     gen_temperature: float = Field(default=0.35, alias="GEN_TEMPERATURE")
     gen_num_ctx: int = Field(default=1024, alias="GEN_NUM_CTX")
     gen_num_predict: int = Field(default=256, alias="GEN_NUM_PREDICT")
+
+    compare_llm: bool = Field(default=True, alias="COMPARE_LLM")
 
     # Umbral / TopK
     abstain_threshold: float = Field(default=0.35, alias="ABSTAIN_THRESHOLD")
