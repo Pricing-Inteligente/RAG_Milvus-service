@@ -9,7 +9,7 @@ import requests, re, json, unicodedata, os
 from datetime import datetime
 from collections import OrderedDict
 # cerca de otros helpers de Milvus
-from retrieve_macro import macro_list, macro_lookup, macro_compare
+from retrieve_macro import macro_list, macro_lookup, macro_compare, _macro_default_countries, _macro_rank
 
 import time
 
@@ -102,6 +102,51 @@ def _extract_macros(text: str) -> list[str]:
         if "__ALL__" not in found:
             found.append("__ALL__")
     return found
+
+
+
+# mapea frases comunes a tus nombres de variable en BD
+_MACRO_SYNONYMS = {
+    "costo de vida": "cpi",
+    "ipc": "cpi",
+    "índice de precios al consumidor": "cpi",
+    "indice de precios al consumidor": "cpi",
+    "inflación": "inflation_rate",
+    "inflacion": "inflation_rate",
+    "tasa de interés": "interest_rate",
+    "tasa de interes": "interest_rate",
+    "cambio del dolar": "usd_exchange",
+    "tipo de cambio": "usd_exchange",
+}
+
+def _canonicalize_macro_var(name: str) -> str:
+    n = _norm(name)
+    for k, v in _MACRO_SYNONYMS.items():
+        if k in n:
+            return v
+    return name
+
+
+
+
+
+# --- MACRO: detectar consultas tipo "¿qué país tiene X más alto/mas bajo?" ---
+_SUPER_MAX_PAT = re.compile(r"\b(más\s+alto|mas\s+alto|mayor|top|máximo|maximo|más\s+caro|mas\s+caro)\b", re.I)
+_SUPER_MIN_PAT = re.compile(r"\b(más\s+bajo|mas\s+bajo|menor|mínimo|minimo|más\s+barato|mas\s+barato)\b", re.I)
+
+def _is_macro_superlative_query(text: str) -> str | None:
+    t = _norm(text)
+    if _SUPER_MAX_PAT.search(t): return "max"
+    if _SUPER_MIN_PAT.search(t): return "min"
+    return None
+
+
+
+
+
+
+
+
 
 
 
@@ -923,16 +968,23 @@ def _prompt_lookup_from_facts(question: str, facts: dict, ctx: str) -> str:
 
 
 def _prompt_macro_humano(intent: str, facts: dict, hint_cta: str) -> str:
-    # facts: dict serializable con variable/país(es)/valores/fechas
+    import json
     return (
         "Eres el asistente del Sistema de Pricing Inteligente (SPI). "
-        "Responde SIEMPRE con 4 partes en español: "
-        "1) Saludo breve. 2) Contexto (variable/país/es y fecha si está). "
-        "3) Respuesta concreta usando SOLO el JSON. 4) Un ÚNICO CTA.\n"
+        "Escribe en español, tono profesional y natural. "
+        "Responde en 3–6 frases de TEXTO PLANO: sin markdown, sin títulos, sin viñetas, "
+        "sin negritas (**), sin encabezados (#) y sin bloques de código. "
+        "NO muestres el JSON ni nombres de campos; úsalo solo como fuente. "
+        "Estructura: 1) saludo breve; 2) contexto (variable/país/es y fecha si aparece); "
+        "3) respuesta con las cifras del JSON; 4) cierre con un único call to action.\n"
         f"FACTS(JSON): {json.dumps(facts, ensure_ascii=False)}\n"
+        f"Evita términos o marcadores como 'end_of_one_example'. "
         f"CTA sugerido: {hint_cta}\n"
-        "RESPUESTA:"
+        "Responde solo el texto final, sin JSON ni formato markdown."
     )
+
+
+
 
 
 
@@ -1334,6 +1386,107 @@ def chat_stream(req: ChatReqStream):
             last = MEM.get(req.session_id) or {}
             if last.get("last_country"):
                 countries = [last["last_country"]]
+
+
+                # ——— SUPERLATIVOS (p.ej. "más alto/más bajo") ———
+        superl = _is_macro_superlative_query(text)  # devuelve "max", "min" o None
+        if superl and macros and "__ALL__" not in macros:
+            var = macros[0]
+            cs = _macro_default_countries()  # usa tu lista de países por defecto
+            ranked = _macro_rank(var, cs)    # [{country, value, unit, date, name}, ...]
+
+            if not ranked:
+                reason = _diagnose_no_results("macro_compare", plan=None, text=text, macros=macros, rows=[])
+                return StreamingResponse(_sse_no_data_ex(reason, {"country": cs}), media_type="text/event-stream")
+
+            # ordena según max/min
+            ranked.sort(key=lambda x: x["value"], reverse=(superl == "max"))
+            best = ranked[0]
+
+            def gen_super():
+                yield f"data: Filtros → variable: {var} | países: {', '.join(cs)}\n\n"
+
+                # Redacción humana
+                facts = {
+                    "type": "macro_rank",
+                    "variable": var,
+                    "order": "desc" if superl == "max" else "asc",
+                    "rows": ranked[:10]
+                }
+                hint = f"El {'más alto' if superl=='max' else 'más bajo'} es {best['country']} ({best['value']} {best.get('unit') or ''} {best.get('date') or ''}). ¿Quieres comparar los 3 primeros?"
+                prompt = _prompt_macro_humano("macro_rank", facts, hint)
+                for chunk in _stream_no_fin(prompt):
+                    yield chunk
+                yield "data: \n\n"
+
+                # Lista compacta
+                topn = 5
+                titulo = "Top 5 más altos" if superl == "max" else "Top 5 más bajos"
+                yield f"data: {titulo}:\n\n"
+                for i, r in enumerate(ranked[:topn], start=1):
+                    yield f"data: {i}. {r['country']}: {r['value']} {r.get('unit') or ''} ({r.get('date') or ''})\n\n"
+
+                yield "data: [FIN]\n\n"
+
+            return StreamingResponse(gen_super(), media_type="text/event-stream")
+
+
+
+
+
+            
+                    # --- Superlativos macro: “¿qué país tiene X más alto/bajo?”
+        superl = _is_macro_superlative_query(text)
+        if superl and macros and "__ALL__" not in macros:
+            var = macros[0]  # ya viene canónico por MACRO_ALIASES
+
+            cs = getattr(S, "countries", None)
+            if not cs:
+                cs = sorted({v for v in COUNTRY_ALIASES.values() if isinstance(v, str) and len(v) == 2})
+
+            rows = macro_compare(var, cs) or []
+            if not rows:
+                reason = _diagnose_no_results("macro_compare", plan=None, text=text, macros=macros, rows=rows)
+                return StreamingResponse(_sse_no_data_ex(reason, {"country": cs}), media_type="text/event-stream")
+
+            key = lambda r: float(r.get("value") or 0.0)
+            best = (max(rows, key=key) if superl == "max" else min(rows, key=key))
+
+            def gen_super():
+                yield f"data: Filtros → variable: {var} | países: {' | '.join(cs)}\n\n"
+                facts = {
+                    "type": "macro_compare",
+                    "variable": var,
+                    "countries": cs,
+                    "rows": [
+                        {"country": x.get("country"), "name": x.get("name"),
+                        "value": x.get("value"), "unit": x.get("unit"), "date": x.get("date")}
+                        for x in rows
+                    ],
+                    "winner": {
+                        "mode": "máximo" if superl == "max" else "mínimo",
+                        "country": best.get("country"),
+                        "value": best.get("value"),
+                        "unit": best.get("unit"),
+                        "date": best.get("date"),
+                        "name": best.get("name"),
+                    },
+                }
+                prompt = _prompt_macro_humano(
+                    "macro_compare",
+                    facts,
+                    "¿Quieres que agregue otro país o ver la serie histórica?"
+                )
+                for chunk in _stream_no_fin(prompt):
+                    yield chunk
+                yield "data: [FIN]\n\n"
+
+            return StreamingResponse(gen_super(), media_type="text/event-stream")
+
+
+
+
+
 
         # ¿hay intención de productos en este mismo turno?
         heur_now = _guess_filters(text)  # país/categoría/tienda detectados por alias
@@ -1880,8 +2033,34 @@ def chat_stream(req: ChatReqStream):
 
                 # Política: necesitamos al menos 2 países con datos
                 if len(with_data) < 2:
-                    reason = _diagnose_no_results("compare", plan=plan, text=text, hits=[])
-                    return StreamingResponse(_sse_no_data_ex(reason, plan.filters), media_type="text/event-stream")
+                    try:
+                        suggestions = {}
+                        for code in without_data:
+                            # agregados por categoría en ese país (sin forzar "cafe")
+                            agg_cat = aggregate_prices({"country": code}, by="category") or {}
+                            groups = agg_cat.get("groups") or []
+                            # prioriza categorías que contengan "cafe" (normalizado)
+                            def _n(s): return (s or "").lower()
+                            candidates = [g.get("group") for g in groups if g and g.get("group")]
+                            cafe_like = [c for c in candidates if "cafe" in _n(c) or "caf" in _n(c) or "coffee" in _n(c)]
+                            suggestions[code] = cafe_like[:3] or candidates[:3]  # top 3
+                    except Exception:
+                        suggestions = {}
+
+                    reason = f"necesito al menos 2 países con datos para '{cat}', pero tuve " \
+                            f"{len(with_data)} con datos y {len(without_data)} sin datos."
+                    def gen_hint():
+                        yield f"data: Hola. No pude comparar porque {reason}\n\n"
+                        yield f"data: Filtros → países: {countries} | categoría: {cat}\n\n"
+                        for code in without_data:
+                            opts = suggestions.get(code) or []
+                            if opts:
+                                yield f"data: Sugerencia para {code}: prueba con categoría(s) {', '.join(opts)}\n\n"
+                            else:
+                                yield f"data: Sugerencia para {code}: prueba sin categoría o con otra similar.\n\n"
+                        yield "data: [FIN]\n\n"
+                    return StreamingResponse(gen_hint(), media_type="text/event-stream")
+
 
                 # --- Si quieres redacción humana, usa LLM con "hechos" agregados
                 if getattr(S, "compare_llm", True):
