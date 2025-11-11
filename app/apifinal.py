@@ -159,7 +159,6 @@ def _normalize_plan_filters(filters: dict | None, text_for_fallback: str) -> dic
 
 
 
-
 def _guess_macro(text: str) -> str | None:
     nt = _norm(text or "")
     for alias, canon in NMACROS.items():
@@ -178,9 +177,6 @@ def _fmt_macro_row(r: dict, idx: int | None = None) -> str:
     prev = r.get("previous")
     prev_txt = f" · Anterior: {prev}" if prev not in (None, "") else ""
     return f"{prefix}{r['name']}: {r['value']}{unit} · Fecha: {date} · País: {r['country']}{prev_txt}"
-
-
-
 
 
 
@@ -632,17 +628,31 @@ def pick_effective_query(user_text: str, sid: Optional[str], prefer_last_cat: bo
         return last_q
     return user_text
 
-def remember_session(sid: Optional[str], *, filters: Dict, intent: str, query: str, hits: List[Dict]):
-    if not sid:
-        return
-    MEM.set(sid, {
-        "last_filters": filters,
+def remember_session(session_id, *, filters, intent, query, hits):
+    last = MEM.get(session_id) or {}
+    lastf = dict(last.get("last_filters") or {})
+
+    # Solo pisa categoría si el turno la mencionó explícitamente o trae valor real
+    mentioned = last.get("last_mentioned") or {}  # si ya guardas este mapa
+    if "category" in filters and filters.get("category"):
+        lastf["category"] = filters["category"]
+    elif mentioned and mentioned.get("category"):
+        lastf["category"] = filters.get("category")
+
+    # country/store sí puedes actualizarlos normalmente
+    if "country" in filters and filters.get("country"):
+        lastf["country"] = filters["country"]
+    if "store" in filters:
+        lastf["store"] = filters.get("store")
+
+    MEM.set(session_id, {
+        **last,
+        "last_filters": lastf,
         "last_intent": intent,
         "last_query": query,
-        "last_product_ids": [h.get("product_id") for h in (hits[:10] if hits else [])],
-        "last_category": filters.get("category"),
-        "last_country": filters.get("country"),
+        "last_mentioned": mentioned
     })
+
 
 # -----------------------------------------------------------------------------
 # Logging / Trazabilidad
@@ -716,9 +726,6 @@ async def _warmup():
     except Exception:
         # no romper inicio por warmup
         pass
-
-
-
 
 
 
@@ -817,12 +824,26 @@ class OllamaLLM:
                 continue
 
 
-def _stream_no_fin(prompt: str):
-    # Envolver el stream del LLM y filtrar el FIN interno
-    for chunk in llm_chat.stream(prompt):
-        if chunk.strip() == "data: [FIN]":
+def _stream_no_fin(prompt: str, *, model=None):
+    """
+    Envuelve el stream del modelo y filtra un '[FIN]' que pudiera emitir.
+    Nunca se llama a sí misma.
+    """
+    m = model or llm_chat  # llm_chat debe ser tu cliente LLM actual
+    for chunk in m.stream(prompt):
+        # Asegura que trabajamos con str
+        if isinstance(chunk, (bytes, bytearray)):
+            s = chunk.decode("utf-8", errors="ignore")
+        else:
+            s = str(chunk)
+
+        # Filtrar un posible FIN que venga del modelo
+        if s.strip() == "data: [FIN]":
             continue
-        yield chunk
+
+        # Ya viene con 'data: ...\n\n' en tu app; si no, podrías envolverlo aquí.
+        yield s
+
 
 
 
@@ -865,21 +886,7 @@ def runtime():
 # -----------------------------------------------------------------------------
 # Prompts RAG
 # -----------------------------------------------------------------------------
-def _prompt_answer_friendly(question: str, ctx: str) -> str:
-    return (
-        "Eres un asistente de retail. SOLO puedes usar los datos del CONTEXTO.\n"
-        "Si el CONTEXTO no contiene la respuesta exacta, responde exactamente:\n"
-        "\"No tengo esa información en la base\".\n"
-        "NO ofrezcas contactar proveedores ni consultar otras bases o páginas externas.\n"
-        "No inventes valores, ni menciones campos que no estén en la base.\n"
-        "Redacta de forma cordial y natural, en 2 a 4 frases máximo. "
-        "Comienza con un saludo breve similar a: \"Hola, con gusto te ayudo.\" "
-        "Incluye la presentación (tamaño) y tienda si están en el CONTEXTO. "
-        "Debes citar al menos un [product_id] de los productos que uses, preferiblemente al final.\n\n"
-        f"CONTEXTO:\n{ctx}\n\n"
-        f"PREGUNTA: {question}\n"
-        "RESPUESTA:"
-    )
+
 
 
 def _prompt_lookup_from_facts(question: str, facts: dict, ctx: str) -> str:
@@ -929,66 +936,6 @@ def _prompt_macro_humano(intent: str, facts: dict, hint_cta: str) -> str:
 
 
 
-
-
-
-
-def _prompt_compare_from_facts(question: str, facts: dict) -> str:
-    """
-    Redacta TODO (saludo, contexto y comparativa) como asistente del Sistema Pricing Inteligente (SPI).
-    Debe incluir por país: promedio, mínimo, máximo, n (registros) y brands_count (marcas).
-    Cierra SIEMPRE con un párrafo de 'resumen + CTA' para seguir filtrando/comparando.
-    No inventes cifras. No recomiendes tiendas ni webs externas.
-    """
-    import json
-    return (
-        "Eres el asistente del Sistema Pricing Inteligente (SPI), una plataforma de analítica de retail en AL.\n"
-        "Rol analítico, no comercial. Escribe en español, tono natural y profesional. Varía el saludo.\n"
-        "Usa EXCLUSIVAMENTE los FACTS; no inventes. Incluye por país: promedio, mínimo, máximo, n y marcas.\n"
-        "Cierra SIEMPRE con un último párrafo de resumen+CTA para filtrar por tienda, presentación o presupuesto.\n"
-        f"FACTS(JSON): {json.dumps(facts, ensure_ascii=False)}\n"
-        f"Pregunta del usuario: {question}\n"
-        "Ahora redacta la respuesta completa."
-    )
-
-
-
-
-
-
-
-
-
-
-def _prompt_lookup_tail(country: str, category: str, avg_txt: str, brand_lines: list[str]) -> str:
-    """
-    Escribe 2–3 frases, tono cordial/natural. Resume el promedio nacional y la
-    tendencia por marcas SIN repetir todos los números. No inventes datos.
-    """
-    facts = f"Promedio nacional: {avg_txt}. Marcas vistas: " + "; ".join(brand_lines[:6])
-    return (
-        "Eres un asistente de retail. Redacta 2 a 3 frases amables y claras, en español.\n"
-        "No repitas listados ni todos los números; da una impresión general y una sugerencia breve de filtro.\n"
-        f"País: {country}. Categoría: {category}. Hechos: {facts}\n"
-        "Ejemplo de tono: 'En general el precio se mueve alrededor del promedio; hay marcas que empujan al alza por formato premium, "
-        "mientras que otras quedan cerca del promedio. Si te sirve, puedo filtrar por presentación o tienda.'"
-    )
-
-
-def _prompt_compare_friendly(user_text: str, ctx_lines: List[str]) -> str:
-    return (
-        "Eres el asistente del Sistema Pricing Inteligente (SPI). "
-        "Responde SIEMPRE con este formato en español: "
-        "1) Saludo breve. 2) Contexto (categoría/país/tienda si se sabe). "
-        "3) Respuesta comparativa clara (precio: promedio/mín/máx si se deduce del CONTEXTO). "
-        "4) Cierre con un único CTA útil.\n"
-        "Usa SOLO los productos del CONTEXTO. Si no alcanza, responde exactamente: "
-        "\"No tengo esa información en la base\".\n"
-        "CTA sugerido: \"¿Quieres que lo ordene o convertir a la misma moneda?\"\n\n"
-        f"CONTEXTO:\n{chr(10).join(ctx_lines)}\n\n"
-        f"PREGUNTA: {user_text}\n"
-        "RESPUESTA:"
-    )
 
 # -----------------------------------------------------------------------------
 # Small-talk
@@ -1111,10 +1058,6 @@ def series_prices(filters: dict | None, days: int = 30) -> list[dict]:
 
 
 
-
-
-
-
 def _prompt_smalltalk(user_msg: str, intent: str) -> str:
     base_persona = (
         f"Eres {ASSISTANT_NAME}. "
@@ -1136,22 +1079,7 @@ def _prompt_smalltalk(user_msg: str, intent: str) -> str:
 # -----------------------------------------------------------------------------
 # Modelos de request
 # -----------------------------------------------------------------------------
-class AskReq(BaseModel):
-    question: str
-    filters: Optional[Dict] = None
-    top_k: Optional[int] = None
-    abstain_threshold: Optional[float] = None
-    session_id: Optional[str] = None
 
-class ListReq(BaseModel):
-    filters: Optional[Dict] = None
-    limit: Optional[int] = 100
-    page: Optional[int] = 1
-
-class AggregateReq(BaseModel):
-    filters: Optional[Dict] = None
-    group_by: Optional[Literal["store", "category", "country"]] = None
-    operation: Optional[Literal["min", "max", "avg"]] = None
 
 class Plan(BaseModel):
     intent: Literal["lookup","list","aggregate","compare","count"]
@@ -1163,11 +1091,6 @@ class Plan(BaseModel):
     top_k: Optional[int] = 5
     limit: Optional[int] = 100
 
-class ChatReq(BaseModel):
-    message: str
-    limit: Optional[int] = 100
-    mode: Optional[Literal["lookup","list","aggregate","compare","count"]] = None
-    session_id: Optional[str] = None
 
 class ChatReqStream(BaseModel):
     message: str
@@ -1286,141 +1209,7 @@ def _plan_from_llm(message: str) -> Optional[Plan]:
     except Exception:
         return None
 
-# -----------------------------------------------------------------------------
-# Facetas
-# -----------------------------------------------------------------------------
-def _facet_suggestions(filters: Dict, top_n: int = 5) -> Dict[str, List[str]]:
-    try:
-        by_cat = aggregate_prices(sanitize_filters(filters), by="category").get("groups", [])
-        by_store = aggregate_prices(sanitize_filters(filters), by="store").get("groups", [])
-        cats = [g["group"] for g in by_cat if g.get("group")][:top_n]
-        stores = [g["group"] for g in by_store if g.get("group")][:top_n]
-        return {"categories": cats, "stores": stores}
-    except Exception:
-        return {"categories": [], "stores": []}
     
-
-
-
-# -----------------------------------------------------------------------------
-# Endpoints principales
-# -----------------------------------------------------------------------------
-@app.post("/ask", tags=["rag"])
-def ask(req: AskReq):
-    try:
-        top_k = req.top_k or getattr(S, "top_k", 5)
-
-        # Filtros con fusión + memoria (si session_id)
-        base_f = build_filters_smart(req.question, req.filters)
-
-        # ¿El usuario mencionó categoría explícita en este turno?
-        heur_now = _guess_filters(req.question)
-        prefer_last_cat = not bool(heur_now.get("category"))
-
-        # Aplica memoria con regla "la categoría de sesión manda" si no se mencionó
-        f = merge_with_memory(base_f, req.session_id, prefer_last_cat=prefer_last_cat)
-
-        # Texto efectivo para el dense search (hereda el 'tema' si hace falta)
-        effective_q = pick_effective_query(req.question, req.session_id, prefer_last_cat)
-
-        hits: List[Dict] = retrieve(effective_q, f)
-        if not hits:
-            return {"answer": "No tengo esa información en la base", "evidence": [], "filters": f}
-
-        ctx = "\n".join(
-            f"[{h['product_id']}] {h['name']} | Marca: {h['brand']} | "
-            f"Pres: {h['size']}{h['unit']} | Precio: {h['price']} {h['currency']} | "
-            f"Tienda: {h['store']} | País: {h['country']}"
-            for h in hits[:top_k]
-        )
-        prompt = _prompt_answer_friendly(req.question, ctx)
-        txt = llm_chat.generate(prompt)
-        ids = re.findall(r"\[(.*?)\]", txt)
-        if not txt or not ids:
-            return {"answer": "No tengo esa información en la base", "evidence": [], "filters": f}
-
-        ids = list(dict.fromkeys(ids))
-        ev = [h for h in hits if h["product_id"] in ids]
-        if not ev:
-            return {"answer": "No tengo esa información en la base", "evidence": [], "filters": f}
-
-        remember_session(req.session_id, filters=f, intent="lookup", query=req.question, hits=hits)
-        return {"answer": txt, "evidence": ev, "top_k_used": top_k, "filters": f}
-    except Exception as e:
-        return {"answer": "No puedo acceder a la base en este momento.", "evidence": [], "error": str(e)[:200]}
-
-@app.post("/list", tags=["products"])
-def list_products(req: ListReq):
-    try:
-        lim = max(1, min(req.limit or 100, getattr(S, "chat_list_max", 1000)))
-        page = max(1, req.page or 1)
-        rows_all = list_by_filter(sanitize_filters(req.filters), limit=lim * page)
-        if not rows_all and req.filters and req.filters.get("category"):
-            f2 = dict(req.filters); f2.pop("category", None)
-            rows_all = list_by_filter(sanitize_filters(f2), limit=lim * page)
-        start = (page - 1) * lim
-        rows = rows_all[start:start + lim]
-        if rows:
-    # contexto mínimo
-            cty = (req.filters or {}).get("country") or "-"
-            cat = (req.filters or {}).get("category") or "-"
-            sample = [
-                {
-                    "name": r.get("name"), "brand": r.get("brand"),
-                    "price": r.get("price"), "currency": r.get("currency"),
-                    "store": r.get("store")
-                } for r in rows[:5]
-            ]
-            prompt = (
-                "Eres el asistente del SPI. Responde con: saludo breve → contexto "
-                "(país/categoría si están) → breve resumen de hallazgos (menciona 1–2 ejemplos) "
-                "→ CTA único (p.ej., \"¿Te muestro solo los más baratos por tienda?\").\n"
-                f"Contexto: país={cty}, categoría={cat}\n"
-                f"Ejemplos(JSON): {json.dumps(sample, ensure_ascii=False)}"
-            )
-            reply = llm_chat.generate(prompt) or "Aquí tienes los productos encontrados. ¿Te muestro los más baratos por tienda?"
-        else:
-            reply = "No tengo esa información en la base"
-
-        chips = _facet_suggestions(req.filters or {})
-        return {
-            "count": len(rows_all),
-            "page": page,
-            "page_size": lim,
-            "items": rows,
-            "reply": reply,
-            "suggestions": chips
-        }
-
-    except Exception as e:
-        return {"count": 0, "items": [], "reply": "No puedo acceder a la base en este momento.", "error": str(e)[:200], "suggestions": {"categories": [], "stores": []}}
-
-@app.post("/aggregate", tags=["products"])
-def aggregate(req: AggregateReq):
-    try:
-        result = aggregate_prices(sanitize_filters(req.filters), by=req.group_by)
-        if req.operation and result.get("groups"):
-            for g in result["groups"]:
-                k = req.operation
-                for m in ["min", "max", "avg"]:
-                    if m != k and m in g:
-                        del g[m]
-        if result.get("groups"):
-            ctx = json.dumps(result.get("groups", [])[:10], ensure_ascii=False)
-            prompt = (
-                f"Eres {ASSISTANT_NAME}. "
-                "Redacta SIEMPRE en 2–4 frases con: saludo breve → contexto (group_by y filtros) "
-                "→ resumen de cifras visibles en el JSON → CTA único (p.ej., "
-                "\"¿Genero una gráfica o convierto a una moneda común?\"). "
-                f"Usa SOLO este JSON: {ctx}. No inventes valores."
-            )
-            summary = llm_chat.generate(prompt) or "Aquí tienes un resumen de precios por grupo."
-            result["reply"] = summary
-        else:
-            result["reply"] = "No tengo esa información en la base"
-        return result
-    except Exception as e:
-        return {"groups": [], "reply": "No puedo acceder a la base en este momento.", "error": str(e)[:200]}
 
 # -----------------------------------------------------------------------------
 # /chat (planner + memoria + comparaciones inteligentes)
@@ -1433,202 +1222,7 @@ def _build_ctx(hits: List[Dict], k: int) -> str:
         for h in hits[:k]
     )
 
-@app.post("/chat", tags=["chat"])
-def chat(req: ChatReq):
-    text = req.message.strip()
 
-    # Small-talk
-    small = _is_smalltalk(text)
-    if small:
-        prompt = _prompt_smalltalk(text, small)
-        reply = llm_chat.generate(prompt)
-        return {"type":"text", "reply": reply, "evidence": [], "model": llm_chat.model}
-    
-    # ------ RUTA MACRO (heurística determinista) ------
-    macro_canon = _guess_macro(text)
-    if macro_canon:
-        # usa países mencionados; si no hay, intenta país de sesión
-        countries = _extract_countries(text) or []
-        if not countries and req.session_id:
-            last = MEM.get(req.session_id) or {}
-            if last.get("last_country"):
-                countries = [last["last_country"]]
-
-        try:
-            if macro_canon == "__ALL__":
-                if not countries:
-                    return {"type": "text", "reply": "Indica un país para consultar variables macroeconómicas.", "evidence": []}
-                rows = macro_list(countries[0])
-                if not rows:
-                    return {"type": "text", "reply": "No tengo esa información en la base", "evidence": []}
-                # respuesta breve y tabla
-                head = f"Variables macroeconómicas de {countries[0]}:"
-                preview = "; ".join(f"{r['name']}: {r['value']}{(' ' + r['unit']) if r.get('unit') else ''}" for r in rows[:6])
-                MEM.set(req.session_id, {"last_country": countries[0]})
-                return {"type": "table", "reply": f"{head} {preview}", "count": len(rows), "items": rows}
-
-            if len(countries) >= 2:
-                rows = macro_compare(macro_canon, countries)
-                if not rows:
-                    return {"type": "text", "reply": "No tengo esa información en la base", "evidence": []}
-                # resumen + filas
-                summary = " | ".join(f"{r['country']}: {r['value']}{(' ' + r['unit']) if r.get('unit') else ''}" for r in rows)
-                return {"type": "text", "reply": f"{macro_canon.upper()} — {summary}", "evidence": rows}
-
-            if len(countries) == 1:
-                r = macro_lookup(macro_canon, countries[0])
-                if not r:
-                    return {"type": "text", "reply": "No tengo esa información en la base", "evidence": []}
-                unit = f" {r['unit']}" if r.get("unit") else ""
-                date = r.get("date") or "-"
-                return {"type": "text", "reply": f"{r['name']} en {r['country']}: {r['value']}{unit} (fecha {date}).", "evidence": [r]}
-
-            # si llegó aquí es porque no dedujimos país y no es __ALL__
-            return {"type": "text", "reply": "Indica el país para esa variable (por ejemplo: 'CPI en Chile').", "evidence": []}
-
-        except Exception as e:
-            return {"type":"text","reply":"No puedo acceder a la base en este momento.","evidence":[],"error":str(e)[:200]}
-
-
-
-    # Planner + fusión
-    plan = _plan_from_llm(text)
-    heur = _guess_filters(text)
-    base_filters = plan.filters if plan else heur
-
-    merged = build_filters_smart(text, base_filters)
-    # Preferir categoría de sesión si el turno NO menciona una
-    heur_now = _guess_filters(text)
-    prefer_last_cat = not bool(heur_now.get("category"))
-    merged = merge_with_memory(merged, req.session_id, prefer_last_cat=prefer_last_cat)
-
-    if not plan:
-        plan = Plan(intent=_classify_intent_heuristic(text),
-                    filters=merged,
-                    top_k=getattr(S, "top_k", 5),
-                    limit=min(max(req.limit or 100, 1), 1000))
-    else:
-        plan.filters = merged
-
-    plan.filters = _normalize_plan_filters(merged, text)
-
-
-    # Regla especial: si pregunta por "precios de productos", forzar listado general
-    nt2 = _norm(text)
-    if ("precio" in nt2 or "precios" in nt2) and ("producto" in nt2 or "productos" in nt2):
-        # Forzar modo listado (todas las filas por país)
-        plan.intent = "list"
-        plan.limit = getattr(S, "chat_list_max", 1000)
-        # Quitar categoría para no limitar (el usuario pidió "productos" en general)
-        if plan.filters and plan.filters.get("category"):
-            f2 = dict(plan.filters)
-            f2.pop("category", None)
-            plan.filters = f2
-
-
-    if req.mode:
-        plan.intent = req.mode
-
-    # ---- EXECUTOR ----
-    try:
-        if plan.intent == "list":
-            items = list_by_filter(plan.filters or None, limit=min(max(plan.limit or 100, 1), 1000))
-            if not items and plan.filters and plan.filters.get("category"):
-                f2 = dict(plan.filters); f2.pop("category", None)
-                items = list_by_filter(f2, limit=min(max(plan.limit or 100, 1), 1000))
-            remember_session(req.session_id, filters=plan.filters, intent="list", query=text, hits=items)
-            if not items:
-                return {"type":"table","reply":"No tengo esa información en la base","count":0,"items":[],"suggestions":{"categories":[],"stores":[]}}
-            chips = _facet_suggestions(plan.filters or {})
-            return {"type":"table","reply":f"Aquí tienes {len(items)} producto(s).","count":len(items),"items":items,"suggestions":chips}
-
-        if plan.intent == "count":
-            items = list_by_filter(plan.filters or None, limit=1000)
-            remember_session(req.session_id, filters=plan.filters, intent="count", query=text, hits=items)
-            return {"type":"text","reply":f"Tengo {len(items)} registro(s) que cumplen ese filtro.","evidence":[]}
-
-        if plan.intent == "aggregate":
-            if not plan.group_by:
-                nt2 = _norm(text)
-                if "tienda" in nt2: plan.group_by = "store"
-                elif "categor" in nt2: plan.group_by = "category"
-                elif "pais" in nt2 or "país" in nt2: plan.group_by = "country"
-            agg = aggregate_prices(plan.filters or None, by=plan.group_by)
-            _log_event("chat_stream_aggregate", {
-            "sid": req.session_id,
-            "filters": plan.filters,
-            "group_by": plan.group_by or "category",
-            "rows": (agg or {}).get("groups", [])[:10],
-            })
-
-            remember_session(req.session_id, filters=plan.filters, intent="aggregate", query=text, hits=[])
-            if not agg.get("groups"):
-                return {"type":"text","reply":"No tengo esa información en la base","evidence":[]}
-            if plan.operation:
-                for g in agg["groups"]:
-                    for m in ["min","max","avg"]:
-                        if m != plan.operation and m in g:
-                            del g[m]
-            return {"type":"aggregate","reply":"Aquí tienes un resumen de precios.","result":agg}
-
-        if plan.intent == "compare":
-            # Soportar comparación con 1 o 0 nombres: top-2 del retrieve
-            effective_q = pick_effective_query(text, req.session_id, prefer_last_cat)
-            hits = retrieve(effective_q, plan.filters or None)[: max(plan.top_k or 5, 5)]
-            if len(hits) < 2:
-                return {"type":"text","reply":"No tengo esa información en la base para comparar.","evidence":[]}
-            ctx_lines = []
-            for h in hits[:2]:
-                ctx_lines.append(f"[{h['product_id']}] {h['name']} | {h['price']} {h['currency']} | {h['store']} | {h['country']}")
-            prompt = _prompt_compare_friendly(text, ctx_lines)
-            txt = llm_chat.generate(prompt)
-            ids = re.findall(r"\[(.*?)\]", txt)
-            ev = [h for h in hits if h["product_id"] in ids]
-            remember_session(req.session_id, filters=plan.filters, intent="compare", query=text, hits=hits)
-            if not txt or not ev:
-                return {"type":"text","reply":"No tengo esa información en la base","evidence":[]}
-            return {"type":"text","reply":txt,"evidence":ev}
-
-        # default: lookup
-        effective_q = pick_effective_query(text, req.session_id, prefer_last_cat)
-        hits = retrieve(effective_q if not plan.product_name else plan.product_name,
-                        plan.filters or None)[: plan.top_k or getattr(S, "top_k", 5)]
-        if not hits and plan.filters and plan.filters.get("category"):
-            f2 = dict(plan.filters); f2.pop("category", None)
-            hits = retrieve(effective_q if not plan.product_name else plan.product_name, f2)[: plan.top_k or getattr(S, "top_k", 5)]
-        remember_session(req.session_id, filters=plan.filters, intent="lookup", query=text, hits=hits)
-        _log_event("chat_stream_lookup", {
-        "sid": req.session_id,
-        "filters": plan.filters,
-        "ids": [h.get("product_id") for h in (hits or [])],
-        })
-
-        if not hits:
-            rows = list_by_filter(plan.filters or {}, limit=min(max(plan.limit or 20, 1), 100))
-            _log_event("chat_stream_list", {
-            "sid": req.session_id,
-            "filters": plan.filters,
-            "count": len(rows) if rows else 0,
-            "sample_ids": [r.get("product_id") for r in (rows[:10] if rows else [])],
-            })
-
-            if rows:
-                chips = _facet_suggestions(plan.filters or {})
-                msg = (f"Encontré {len(rows)} producto(s) con tu filtro. "
-                       "¿Quieres afinar por categoría/marca/unidad?")
-                return {"type":"table","reply":msg,"count":len(rows),"items":rows[:10],"suggestions":chips}
-            return {"type":"text","reply":"No tengo esa información en la base","evidence":[]}
-
-        ctx = _build_ctx(hits, plan.top_k or getattr(S, "top_k", 5))
-        prompt = _prompt_answer_friendly(text, ctx)
-        txt = llm_chat.generate(prompt)
-        ids = re.findall(r"\[(.*?)\]", txt)
-        ev = [h for h in hits if h["product_id"] in ids]
-        if not txt or not ev:
-            return {"type":"text","reply":"No tengo esa información en la base","evidence":[]}
-        return {"type":"text","reply":txt,"evidence":ev}
-    except Exception as e:
-        return {"type":"text","reply":"No puedo acceder a la base en este momento.","evidence":[],"error":str(e)[:200]}
 
 # -----------------------------------------------------------------------------
 # /chat/stream (memoria + encabezado de filtros)
@@ -1955,7 +1549,9 @@ def chat_stream(req: ChatReqStream):
 
 
 
-
+        # Detectar intents especiales por texto ANTES del planner
+    force_topn  = _is_topn_query(text)
+    force_trend = _is_trend_query(text)
 
     # 1) Planner LLM (si aplica) + heurística directa  (TIMED)
     planner_ms = None                     # ← NUEVO
@@ -1987,11 +1583,7 @@ def chat_stream(req: ChatReqStream):
         },
     )
 
-        # --- Forzar intent si el usuario pidió explícitamente topN o tendencia ---
-    if force_topn:
-        plan.intent = "topn"
-    elif force_trend:
-        plan.intent = "trend"
+  
 
 
     # 5) Si no hubo plan, crear uno heurístico
@@ -2006,6 +1598,13 @@ def chat_stream(req: ChatReqStream):
         plan.filters = merged
 
     plan.filters = _normalize_plan_filters(plan.filters, text)
+
+    # Si el usuario NO mencionó categoría en este turno,
+# y la intención es un TOP-N o TREND, NO rellenes categoría semánticamente:
+    explicit_cat = bool(heur_now.get("category"))  # heur_now ya lo calculas arriba
+    if plan.intent in ("topn", "trend") and not explicit_cat:
+        plan.filters.pop("category", None)  # fuerza "sin categoría" → todo el país
+
 
     if force_topn:
         plan.intent = "topn"
@@ -2119,7 +1718,6 @@ def chat_stream(req: ChatReqStream):
 
     
 
-
         # ---- TOPN → top N más baratos/caros ----
     if plan.intent == "topn":
         try:
@@ -2180,7 +1778,6 @@ def chat_stream(req: ChatReqStream):
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
-
        
      # ---- TREND → tendencia últimos 30 días (o rango corto) ----
     if plan.intent == "trend":
@@ -2238,10 +1835,6 @@ def chat_stream(req: ChatReqStream):
 
         return StreamingResponse(gen_trend(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
-
-
-
-
 
 
 
@@ -2470,8 +2063,6 @@ def chat_stream(req: ChatReqStream):
             return StreamingResponse(_sse_no_data_ex(reason, plan.filters), media_type="text/event-stream")
 
 
-
-
     # ---- AGGREGATE → stream de resumen agregado ----
     if plan.intent == "aggregate":
         try:
@@ -2573,8 +2164,6 @@ def chat_stream(req: ChatReqStream):
             top_cat = Counter(hit_cats).most_common(1)[0][0]
             if top_cat:
                 facts_filters["category"] = top_cat
-
-
 
 
     except Exception as e:
@@ -2710,8 +2299,6 @@ def chat_stream(req: ChatReqStream):
         yield "data: [FIN]\n\n"
 
     return StreamingResponse(gen_lookup(), media_type="text/event-stream")
-
-
 
 
 # -----------------------------------------------------------------------------
