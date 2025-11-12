@@ -15,21 +15,21 @@ import time
 
 
 
-# === Config ===
+# Config
 from settings import get_settings
 S = get_settings()
 
-# === Milvus helpers ===
+# Milvus helpers
 from retrieve import retrieve, list_by_filter, aggregate_prices
 
-# === Inteligencia de intención / categoría ===
+# Inteligencia de intención / categoría 
 from intent_llm import parse_intent
 from category_resolver import resolve_category_semantic
 
 
-# -----------------------------------------------------------------------------
+
 # Utilidades de normalización y alias
-# -----------------------------------------------------------------------------
+
 def _norm(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", s.lower())
                    if unicodedata.category(c) != "Mn")
@@ -51,7 +51,7 @@ NCOUNTRIES = { _norm(alias): code
                for alias in aliases }
 
 
-# === Macros (alias → canónico) ===
+# Macros
 MACRO_ALIASES = {
     "exchange_rate": [
         "exchange rate", "tipo de cambio",
@@ -75,7 +75,7 @@ MACRO_ALIASES = {
         "inflacion", "inflación"
     ],
     "interest_rate": [
-        "interest rate", "interest trate",  # typo cubierto
+        "interest rate", "interest trate",  
         "tasa de interes", "tasa de interés",
         "tipo de interes", "tipo de interés"
     ],
@@ -130,7 +130,7 @@ def _canonicalize_macro_var(name: str) -> str:
 
 
 
-# --- MACRO: detectar consultas tipo "¿qué país tiene X más alto/mas bajo?" ---
+# MACRO: detectar consultas tipo "¿qué país tiene X más alto/mas bajo?" 
 _SUPER_MAX_PAT = re.compile(r"\b(más\s+alto|mas\s+alto|mayor|top|máximo|maximo|más\s+caro|mas\s+caro)\b", re.I)
 _SUPER_MIN_PAT = re.compile(r"\b(más\s+bajo|mas\s+bajo|menor|mínimo|minimo|más\s+barato|mas\s+barato)\b", re.I)
 
@@ -139,11 +139,6 @@ def _is_macro_superlative_query(text: str) -> str | None:
     if _SUPER_MAX_PAT.search(t): return "max"
     if _SUPER_MIN_PAT.search(t): return "min"
     return None
-
-
-
-
-
 
 
 
@@ -225,8 +220,8 @@ def _fmt_macro_row(r: dict, idx: int | None = None) -> str:
 
 
 
-# --- ALIAS → categoría canónica (según Milvus) ---
-# OJO: ahora las claves del dict son las CATEGORÍAS que existen en Milvus,
+# ALIAS: categoría canónica (según Milvus)
+# las claves del dict son las CATEGORÍAS que existen en Milvus,
 # y los valores son las listas de ALIAS que pueden escribir los usuarios.
 CAT_ALIASES = {
     # arroz
@@ -244,7 +239,7 @@ CAT_ALIASES = {
         "leche uht", "leche entera", "leche descremada", "leche semidescremada"
     ],
 
-    # leche (en polvo u otra presentación que tengas etiquetada como 'leche')
+    # leche 
     "leche": ["leche en polvo", "leche polvo"],
 
     # pasta seca
@@ -310,11 +305,11 @@ CAT_ALIASES = {
     # banano
     "banano": ["banano", "bananos", "banana", "bananas"],
 
-    # pan (genérico que tienes como categoría)
+    # pan 
     "pan": ["pan", "pan frances", "pan francés", "bollos"],
 }
 
-# Construimos el mapa alias → canon normalizado
+# Construimos el mapa alias
 NCATEGORIES = {
     _norm(alias): canon
     for canon, aliases in CAT_ALIASES.items()
@@ -322,8 +317,7 @@ NCATEGORIES = {
 }
 
 # Categorías GENÉRICAS que NO existen tal cual en Milvus.
-# No deben mapearse a una categoría concreta; úsalas para activar
-# el refinamiento semántico en build_filters_smart (si lo tienes).
+# el refinamiento semántico en build_filters_smart
 GENERIC_CATS = {"lacteos", "lácteos", "alimentos", "bebidas", "aseo", "hogar"}
 
 
@@ -382,9 +376,8 @@ def sanitize_filters(f: Dict | None) -> Dict:
             out[k] = f[k]
     return out
 
-# -----------------------------------------------------------------------------
 # Fusión inteligente de filtros (Heurística + LLM + Semántico)
-# -----------------------------------------------------------------------------
+
 def build_filters_smart(message: str, base: Optional[Dict] = None) -> Dict:
     """
     Prioriza:
@@ -413,18 +406,18 @@ def build_filters_smart(message: str, base: Optional[Dict] = None) -> Dict:
     if llm.get("brand"):    filters.setdefault("brand", llm["brand"])
     if llm.get("category"):
         c_llm = _norm(llm["category"])
-        # si es genérica, NO la setees (deja que actúe el resolutor semántico)
+        
         if c_llm not in { _norm(x) for x in GENERIC_CATS }:
             canon = NCATEGORIES.get(c_llm)
             if canon:
                 filters.setdefault("category", canon)
 
-    # --- Nuevo: si hay indicios macro, NO intentamos resolver categoría semántica ---
+    # si hay indicios macro, NO intentamos resolver categoría semántica
     macro_hint = bool(_extract_macros(message)) or bool(_guess_macro(message))
     if macro_hint:
         return sanitize_filters(filters)
 
-    # Semantic fallback (only category)
+    # Semantic fallback (solo category)
     if "category" not in filters or not filters.get("category"):
         cat_sem, score_sem, _ = resolve_category_semantic(
             message, min_cosine=float(getattr(S, "category_min_cosine", 0.60))
@@ -434,9 +427,8 @@ def build_filters_smart(message: str, base: Optional[Dict] = None) -> Dict:
 
     return sanitize_filters(filters)
 
-# -----------------------------------------------------------------------------
 # Memoria de sesión (simple LRU en memoria)
-# -----------------------------------------------------------------------------
+
 class SessionMemory:
     def __init__(self, max_sessions: int = 500):
         self.max_sessions = max_sessions
@@ -487,34 +479,34 @@ def merge_with_memory(
     last = MEM.get(sid) or {}
     lastf = last.get("last_filters", {}) or {}
 
-    merged = dict(filters)  # ya viene "sanitize_filters" aguas arriba normalmente
+    merged = dict(filters)  
 
-    # --- country ---
+    # country
     if not merged.get("country") and lastf.get("country"):
         merged["country"] = lastf["country"]
 
-    # --- category ---
+    # category 
     if not merged.get("category") and lastf.get("category"):
         merged["category"] = lastf["category"]
     if prefer_last_cat and not m_cat and lastf.get("category"):
         # Fuerza la categoría anterior cuando no se mencionó explícitamente una nueva
         merged["category"] = lastf["category"]
 
-    # --- store (política de persistencia condicionada) ---
+    #  store (política de persistencia condicionada) 
     if m_sto:
         # Si mencionaron tienda, respetamos lo que ya venga en merged
         pass
     else:
         # Si NO mencionaron tienda:
-        #   - Copiamos la anterior SOLO si categoría y país quedaron iguales
-        #   - Si categoría/país cambiaron, descartamos tienda previa
+        # Copiamos la anterior SOLO si categoría y país quedaron iguales
+        # Si categoría/país cambiaron, descartamos tienda previa
         same_cat = merged.get("category") == lastf.get("category")
         same_cty = merged.get("country") == lastf.get("country")
         if not merged.get("store"):
             if same_cat and same_cty and lastf.get("store"):
                 merged["store"] = lastf["store"]
         else:
-            # merged ya trae store (p.ej. por heurística), pero si el usuario cambió
+            # merged ya trae store, pero si el usuario cambió
             # cat/país sin mencionar tienda, eliminamos la tienda para no arrastrarla
             if not (same_cat and same_cty):
                 merged.pop("store", None)
@@ -529,9 +521,9 @@ def _filters_head(f: Dict) -> str:
             f"categoría: {f.get('category') or '-'} | "
             f"tienda: {f.get('store') or '-'}")
 
-# -----------------------------------------------------------------------------
+
 # Visualización — construcción de prompt para la API externa de gráficos
-# -----------------------------------------------------------------------------
+
 def _viz_title(filters: Dict, intent: str, group_by: str | None = None) -> str:
     cat = (filters or {}).get("category") or "productos"
     cty = (filters or {}).get("country")
@@ -678,13 +670,13 @@ def remember_session(session_id, *, filters, intent, query, hits):
     lastf = dict(last.get("last_filters") or {})
 
     # Solo pisa categoría si el turno la mencionó explícitamente o trae valor real
-    mentioned = last.get("last_mentioned") or {}  # si ya guardas este mapa
+    mentioned = last.get("last_mentioned") or {}  
     if "category" in filters and filters.get("category"):
         lastf["category"] = filters["category"]
     elif mentioned and mentioned.get("category"):
         lastf["category"] = filters.get("category")
 
-    # country/store sí puedes actualizarlos normalmente
+    
     if "country" in filters and filters.get("country"):
         lastf["country"] = filters["country"]
     if "store" in filters:
@@ -699,9 +691,8 @@ def remember_session(session_id, *, filters, intent, query, hits):
     })
 
 
-# -----------------------------------------------------------------------------
 # Logging / Trazabilidad
-# -----------------------------------------------------------------------------
+
 def _log_event(kind: str, payload: dict):
     try:
         os.makedirs("logs", exist_ok=True)
@@ -733,9 +724,9 @@ def _log_perf(event: str, payload: dict):
 
 
 
-# -----------------------------------------------------------------------------
+
 # CORS / App
-# -----------------------------------------------------------------------------
+
 app = FastAPI(title="RAG Pricing API", version="1.8.0")
 
 
@@ -783,10 +774,10 @@ def options_chat_stream():
 
 
 origins = [
-    "http://localhost:5173",  # tu frontend local
+    "http://localhost:5173",  # frontend local
     "http://127.0.0.1:5173",  # a veces Vite usa 127.0.0.1
     "http://localhost:8080",  # Lovable local
-    "http://localhost:8081",      # <— añade esto
+    "http://localhost:8081",      
     "http://127.0.0.1:8081",
 ]
 
@@ -800,9 +791,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
+
 # Cliente LLM (Ollama)
-# -----------------------------------------------------------------------------
 class OllamaLLM:
     def __init__(self, model: str, base_url: str, temperature: float = 0.1,
                  num_ctx: int = 2048, num_predict: int = 256, timeout: int = 120):
@@ -874,7 +864,7 @@ def _stream_no_fin(prompt: str, *, model=None):
     Envuelve el stream del modelo y filtra un '[FIN]' que pudiera emitir.
     Nunca se llama a sí misma.
     """
-    m = model or llm_chat  # llm_chat debe ser tu cliente LLM actual
+    m = model or llm_chat  
     for chunk in m.stream(prompt):
         # Asegura que trabajamos con str
         if isinstance(chunk, (bytes, bytearray)):
@@ -886,7 +876,7 @@ def _stream_no_fin(prompt: str, *, model=None):
         if s.strip() == "data: [FIN]":
             continue
 
-        # Ya viene con 'data: ...\n\n' en tu app; si no, podrías envolverlo aquí.
+        # Ya viene con 'data: ...\n\n'
         yield s
 
 
@@ -908,9 +898,9 @@ llm_chat = OllamaLLM(
 def _llm_json(prompt: str) -> str:
     return llm_strict.generate(prompt)
 
-# -----------------------------------------------------------------------------
+
 # Root/health/runtime
-# -----------------------------------------------------------------------------
+
 @app.get("/", tags=["root"])
 def root():
     return {"ok": True, "name": "retail-rag-api", "mode": "read-only", "docs": "/docs"}
@@ -928,10 +918,8 @@ def runtime():
         "embed_model": S.embed_model,
     }
 
-# -----------------------------------------------------------------------------
-# Prompts RAG
-# -----------------------------------------------------------------------------
 
+# Prompts RAG
 
 
 def _prompt_lookup_from_facts(question: str, facts: dict, ctx: str) -> str:
@@ -989,9 +977,8 @@ def _prompt_macro_humano(intent: str, facts: dict, hint_cta: str) -> str:
 
 
 
-# -----------------------------------------------------------------------------
+
 # Small-talk
-# -----------------------------------------------------------------------------
 _GREET_PAT = re.compile(r"\b(hola|buen[oa]s?\s+d[ií]as|buenas?\s+tardes|buenas?\s+noches|hi|hello|hey)\b", re.I)
 _THANKS_PAT = re.compile(r"\b(gracias|thank(s)?|mil\s+gracias)\b", re.I)
 _BYE_PAT = re.compile(r"\b(chao|ad[ií]os|hasta\s+luego|bye)\b", re.I)

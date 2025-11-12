@@ -1,3 +1,1268 @@
+# app/api.py — Conversacional con memoria de sesión y comparaciones inteligentes
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Response
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, List, Literal
+import requests, re, json, unicodedata, os
+from datetime import datetime
+from collections import OrderedDict
+# cerca de otros helpers de Milvus
+from retrieve_macro import macro_list, macro_lookup, macro_compare, _macro_default_countries, _macro_rank
+
+import time
+
+
+
+# Config
+from settings import get_settings
+S = get_settings()
+
+# Milvus helpers
+from retrieve import retrieve, list_by_filter, aggregate_prices
+
+# Inteligencia de intención / categoría 
+from intent_llm import parse_intent
+from category_resolver import resolve_category_semantic
+
+
+
+# Utilidades de normalización y alias
+
+def _norm(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s.lower())
+                   if unicodedata.category(c) != "Mn")
+
+COUNTRY_ALIASES = {
+    "MX": ["mx", "mexico", "méxico"],
+    "BR": ["br", "brasil", "brazil"],
+    "AR": ["ar", "argentina"],
+    "CO": ["co", "colombia"],
+    "CL": ["cl", "chile"],
+    "PE": ["pe", "peru", "perú"],
+    "EC": ["ec", "ecuador"],
+    "CR": ["cr", "costa rica", "costa-rica", "costa_rica", "costarica"],
+    "PA": ["pa", "panama", "panamá"],
+    "PY": ["py", "paraguay"],
+}
+NCOUNTRIES = { _norm(alias): code
+               for code, aliases in COUNTRY_ALIASES.items()
+               for alias in aliases }
+
+
+# Macros
+MACRO_ALIASES = {
+    "exchange_rate": [
+        "exchange rate", "tipo de cambio",
+        "cambio dolar", "cambio del dolar", "cambio del dólar",
+        "dolar", "dólar"
+    ],
+    "cpi": [
+        "cpi", "ipc",
+        "indice de precios al consumidor", "índice de precios al consumidor",
+        "costo de vida", "coste de vida", "costo de la vida", "cost of living"
+    ],
+    "gdp": [
+        "gdp", "pib", "producto interno bruto", "producto interno bruto (pib)"
+    ],
+    "gini_index": [
+        "gini index", "indice de gini", "índice de gini",
+        "coeficiente de gini", "gini coefficient"
+    ],
+    "inflation_rate": [
+        "inflation rate", "tasa de inflacion", "tasa de inflación",
+        "inflacion", "inflación"
+    ],
+    "interest_rate": [
+        "interest rate", "interest trate",  
+        "tasa de interes", "tasa de interés",
+        "tipo de interes", "tipo de interés"
+    ],
+    "producer_prices": [
+        "producer prices",
+        "indice de precios al productor", "índice de precios al productor",
+        "ipp", "ppi"
+    ],
+}
+NMACROS = { _norm(alias): canon
+            for canon, aliases in MACRO_ALIASES.items()
+            for alias in aliases }
+
+def _extract_macros(text: str) -> list[str]:
+    nt = _norm(text or "")
+    found: list[str] = []
+    for alias, canon in NMACROS.items():
+        if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", nt):
+            if canon not in found:
+                found.append(canon)
+    # soporta también el caso "macro"/"variables macroeconómicas"
+    if ("variables macroeconomicas" in nt or "variables macroeconómicas" in nt
+        or re.search(r"(?<!\w)macro(?!\w)", nt)):
+        if "__ALL__" not in found:
+            found.append("__ALL__")
+    return found
+
+
+
+# mapea frases comunes a tus nombres de variable en BD
+_MACRO_SYNONYMS = {
+    "costo de vida": "cpi",
+    "ipc": "cpi",
+    "índice de precios al consumidor": "cpi",
+    "indice de precios al consumidor": "cpi",
+    "inflación": "inflation_rate",
+    "inflacion": "inflation_rate",
+    "tasa de interés": "interest_rate",
+    "tasa de interes": "interest_rate",
+    "cambio del dolar": "usd_exchange",
+    "tipo de cambio": "usd_exchange",
+}
+
+def _canonicalize_macro_var(name: str) -> str:
+    n = _norm(name)
+    for k, v in _MACRO_SYNONYMS.items():
+        if k in n:
+            return v
+    return name
+
+
+
+
+
+# MACRO: detectar consultas tipo "¿qué país tiene X más alto/mas bajo?" 
+_SUPER_MAX_PAT = re.compile(r"\b(más\s+alto|mas\s+alto|mayor|top|máximo|maximo|más\s+caro|mas\s+caro)\b", re.I)
+_SUPER_MIN_PAT = re.compile(r"\b(más\s+bajo|mas\s+bajo|menor|mínimo|minimo|más\s+barato|mas\s+barato)\b", re.I)
+
+def _is_macro_superlative_query(text: str) -> str | None:
+    t = _norm(text)
+    if _SUPER_MAX_PAT.search(t): return "max"
+    if _SUPER_MIN_PAT.search(t): return "min"
+    return None
+
+
+
+
+
+
+import ast
+
+def _coerce_country_list(val):
+    """Acepta 'CO' | ['CO','BR'] | "['CO','BR']" y devuelve una lista ['CO', 'BR']."""
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return [str(x).strip().upper() for x in val if x]
+    if isinstance(val, str):
+        s = val.strip()
+        # string que parece lista
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                arr = ast.literal_eval(s)
+                return [str(x).strip().upper() for x in arr if x]
+            except Exception:
+                pass
+        # valor único
+        return [s.strip().upper()]
+    return [str(val).strip().upper()]
+
+def _canonicalize_category(cat_or_text: str | None) -> str | None:
+    """Devuelve la categoría canónica según tu resolver semántico."""
+    if not cat_or_text:
+        return None
+    try:
+        from category_resolver import resolve_category_semantic
+        cat, score, _ = resolve_category_semantic(
+            str(cat_or_text),
+            min_cosine=float(getattr(S, "category_min_cosine", 0.60))
+        )
+        return cat
+    except Exception:
+        return None
+
+def _normalize_plan_filters(filters: dict | None, text_for_fallback: str) -> dict:
+    f = dict(filters or {})
+    # country → lista
+    if "country" in f:
+        clist = _coerce_country_list(f.get("country"))
+        if clist:
+            f["country"] = clist
+        else:
+            f.pop("country", None)
+    # category → canónica
+    cat = f.get("category") or _canonicalize_category(text_for_fallback)
+    if cat:
+        f["category"] = cat
+    else:
+        f.pop("category", None)
+    return f
+
+
+
+def _guess_macro(text: str) -> str | None:
+    nt = _norm(text or "")
+    for alias, canon in NMACROS.items():
+        if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", nt):
+            return canon
+    # “variables macroeconomicas de X”, “macro de X”
+    if ("variables macroeconomicas" in nt or "variables macroeconómicas" in nt
+        or re.search(r"(?<!\w)macro(?!\w)", nt)):
+        return "__ALL__"  # pedir todas para un país
+    return None
+
+def _fmt_macro_row(r: dict, idx: int | None = None) -> str:
+    prefix = f"{idx}. " if idx is not None else ""
+    unit = f" {r.get('unit')}" if r.get('unit') else ""
+    date = r.get("date") or r.get("fecha") or "-"
+    prev = r.get("previous")
+    prev_txt = f" · Anterior: {prev}" if prev not in (None, "") else ""
+    return f"{prefix}{r['name']}: {r['value']}{unit} · Fecha: {date} · País: {r['country']}{prev_txt}"
+
+
+
+# ALIAS: categoría canónica (según Milvus)
+# las claves del dict son las CATEGORÍAS que existen en Milvus,
+# y los valores son las listas de ALIAS que pueden escribir los usuarios.
+CAT_ALIASES = {
+    # arroz
+    "arroz": ["arroz", "rice"],
+
+    # pan de molde
+    "pan_de_molde": [
+        "pan de molde", "pan tajado", "pan lactal", "pan de caja",
+        "pan sandwich", "pan sándwich", "pan bimbo"
+    ],
+
+    # leche líquida
+    "leche_liquida": [
+        "leche", "leches", "leche liquida", "leche líquida",
+        "leche uht", "leche entera", "leche descremada", "leche semidescremada"
+    ],
+
+    # leche 
+    "leche": ["leche en polvo", "leche polvo"],
+
+    # pasta seca
+    "pasta_seca": ["pasta", "espagueti", "espaguetis", "spaghetti", "fideos", "macarrones"],
+
+    # azúcar
+    "azucar": ["azucar", "azúcar", "sugar"],
+
+    # café (genérico) y molido
+    "cafe": ["cafe", "café", "cafe instantaneo", "café instantáneo"],
+    "cafe_molido": ["cafe molido", "café molido", "cafe tostado y molido", "café tostado y molido"],
+
+    # aceite vegetal
+    "aceite_vegetal": [
+        "aceite", "aceite vegetal", "aceite de cocina",
+        "aceite de girasol", "aceite de soya", "aceite de soja",
+        "aceite de maiz", "aceite de maíz"
+    ],
+
+    # huevo
+    "huevo": ["huevo", "huevos", "docena de huevos"],
+
+    # pollo entero
+    "pollo_entero": ["pollo", "pollo entero", "pollo fresco", "pollo asadero"],
+
+    # refrescos de cola
+    "refrescos_de_cola": [
+        "refresco de cola", "refrescos de cola", "gaseosa", "gaseosas",
+        "gaseosa de cola", "soda", "cola", "coca cola", "coca-cola"
+    ],
+
+    # papa
+    "papa": ["papa", "papas", "patata", "patatas"],
+
+    # frijol
+    "frijol": ["frijol", "frijoles", "poroto", "porotos", "alubia", "alubias"],
+
+    # harina de trigo
+    "harina_de_trigo": ["harina", "harina de trigo"],
+
+    # cerveza
+    "cerveza": ["cerveza", "beer"],
+
+    # queso blando
+    "queso_blando": [
+        "queso", "quesos", "queso fresco", "queso doble crema",
+        "queso mozarella", "queso mozzarella"
+    ],
+
+    # atún (genérico) y en lata
+    "atun": ["atun", "atún"],
+    "atun_en_lata": ["atun en lata", "atún en lata", "lata de atun", "lata de atún"],
+
+    # tomate
+    "tomate": ["tomate", "jitomate", "tomates"],
+
+    # cebolla
+    "cebolla": ["cebolla", "cebollas", "onion"],
+
+    # manzana
+    "manzana": ["manzana", "manzanas", "apple"],
+
+    # banano
+    "banano": ["banano", "bananos", "banana", "bananas"],
+
+    # pan 
+    "pan": ["pan", "pan frances", "pan francés", "bollos"],
+}
+
+# Construimos el mapa alias
+NCATEGORIES = {
+    _norm(alias): canon
+    for canon, aliases in CAT_ALIASES.items()
+    for alias in aliases
+}
+
+# Categorías GENÉRICAS que NO existen tal cual en Milvus.
+# el refinamiento semántico en build_filters_smart
+GENERIC_CATS = {"lacteos", "lácteos", "alimentos", "bebidas", "aseo", "hogar"}
+
+
+STORE_ALIASES = {
+    "Exito": ["exito", "éxito"],
+    "Jumbo": ["jumbo", "jumboco", "jumboar", "jumbope"],
+    "Olimpica": ["olimpica", "olímpica"],
+    "Carulla": ["carulla"],
+    "Ara": ["ara"],
+    "D1": ["d1"],
+    "Walmart": ["walmart"],
+    "Soriana": ["soriana"],
+    "Chedraui": ["chedraui"],
+    "Lider": ["lider", "líder"],
+    "Wong": ["wong"],
+    "Metro": ["metro", "metrope"],
+    "Tottus": ["tottus"],
+    "Carrefour": ["carrefour", "carrefourbr", "carrefourar"],
+    "Assai": ["assai", "assaí"],
+    "PaoDeAcucar": ["pao de acucar", "pao de açúcar", "pão de açúcar", "paodeacucar"],
+    "Atacadao": ["atacadao", "atacadão"],
+    "Extra": ["extra"],
+}
+NSTORES = { _norm(alias): canon
+            for canon, aliases in STORE_ALIASES.items()
+            for alias in aliases }
+
+def sanitize_filters(f: Dict | None) -> Dict:
+    if not f:
+        return {}
+    out: Dict = {}
+
+    # country
+    v = f.get("country")
+    if v:
+        nv = _norm(str(v))
+        out["country"] = NCOUNTRIES.get(nv, str(v).upper())
+
+    # category
+    v = f.get("category")
+    if v:
+        nv = _norm(str(v))
+        canon = NCATEGORIES.get(nv)
+        if canon:
+            out["category"] = canon
+
+    # store
+    v = f.get("store")
+    if v:
+        nv = _norm(str(v))
+        canon = NSTORES.get(nv)
+        out["store"] = canon if canon else str(v)
+
+    for k in ["brand", "name"]:
+        if k in f and f[k] not in (None, ""):
+            out[k] = f[k]
+    return out
+
+# Fusión inteligente de filtros (Heurística + LLM + Semántico)
+
+def build_filters_smart(message: str, base: Optional[Dict] = None) -> Dict:
+    """
+    Prioriza:
+    1) base (usuario/frontend)
+    2) heurística por aliases en el texto
+    3) LLM (parse_intent)
+    4) resolutor semántico por embeddings (si aún no hay categoría)
+    """
+    filters: Dict = sanitize_filters(base or {})
+
+    nt = _norm(message)
+    for alias, code in NCOUNTRIES.items():
+        if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", nt):
+            filters.setdefault("country", code); break
+    for alias, canon in NCATEGORIES.items():
+        if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", nt):
+            filters.setdefault("category", canon); break
+    for alias, canon in NSTORES.items():
+        if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", nt):
+            filters.setdefault("store", canon); break
+
+    # LLM structured intent
+    llm = parse_intent(message)
+    if llm.get("country"):  filters.setdefault("country", llm["country"])
+    if llm.get("store"):    filters.setdefault("store", llm["store"])
+    if llm.get("brand"):    filters.setdefault("brand", llm["brand"])
+    if llm.get("category"):
+        c_llm = _norm(llm["category"])
+        
+        if c_llm not in { _norm(x) for x in GENERIC_CATS }:
+            canon = NCATEGORIES.get(c_llm)
+            if canon:
+                filters.setdefault("category", canon)
+
+    # si hay indicios macro, NO intentamos resolver categoría semántica
+    macro_hint = bool(_extract_macros(message)) or bool(_guess_macro(message))
+    if macro_hint:
+        return sanitize_filters(filters)
+
+    # Semantic fallback (solo category)
+    if "category" not in filters or not filters.get("category"):
+        cat_sem, score_sem, _ = resolve_category_semantic(
+            message, min_cosine=float(getattr(S, "category_min_cosine", 0.60))
+        )
+        if cat_sem:
+            filters["category"] = cat_sem
+
+    return sanitize_filters(filters)
+
+# Memoria de sesión (simple LRU en memoria)
+
+class SessionMemory:
+    def __init__(self, max_sessions: int = 500):
+        self.max_sessions = max_sessions
+        self.store: "OrderedDict[str, dict]" = OrderedDict()
+
+    def get(self, sid: Optional[str]) -> dict:
+        if not sid:
+            return {}
+        val = self.store.get(sid) or {}
+        if sid in self.store:
+            self.store.move_to_end(sid, last=True)
+        return val
+
+    def set(self, sid: Optional[str], data: dict):
+        if not sid:
+            return
+        if sid in self.store:
+            self.store[sid].update(data)
+            self.store.move_to_end(sid, last=True)
+        else:
+            self.store[sid] = dict(data)
+        while len(self.store) > self.max_sessions:
+            self.store.popitem(last=False)
+
+MEM = SessionMemory()
+
+def merge_with_memory(
+    filters: Dict,
+    sid: Optional[str],
+    prefer_last_cat: bool = False,
+    mentioned: Optional[Dict[str, bool]] = None
+) -> Dict:
+    """
+    Rellena con la última sesión y aplica políticas:
+    - Si prefer_last_cat=True y NO se mencionó categoría explícita, fuerza la última categoría.
+    - country persiste si no se menciona uno nuevo.
+    - store solo persiste si (category y country) permanecen iguales a los de la sesión
+      y el turno NO mencionó explícitamente store.
+    """
+    if not sid:
+        return filters
+
+    mentioned = mentioned or {}
+    m_cat = bool(mentioned.get("category"))
+    m_cty = bool(mentioned.get("country"))
+    m_sto = bool(mentioned.get("store"))
+
+    last = MEM.get(sid) or {}
+    lastf = last.get("last_filters", {}) or {}
+
+    merged = dict(filters)  
+
+    # country
+    if not merged.get("country") and lastf.get("country"):
+        merged["country"] = lastf["country"]
+
+    # category 
+    if not merged.get("category") and lastf.get("category"):
+        merged["category"] = lastf["category"]
+    if prefer_last_cat and not m_cat and lastf.get("category"):
+        # Fuerza la categoría anterior cuando no se mencionó explícitamente una nueva
+        merged["category"] = lastf["category"]
+
+    #  store (política de persistencia condicionada) 
+    if m_sto:
+        # Si mencionaron tienda, respetamos lo que ya venga en merged
+        pass
+    else:
+        # Si NO mencionaron tienda:
+        # Copiamos la anterior SOLO si categoría y país quedaron iguales
+        # Si categoría/país cambiaron, descartamos tienda previa
+        same_cat = merged.get("category") == lastf.get("category")
+        same_cty = merged.get("country") == lastf.get("country")
+        if not merged.get("store"):
+            if same_cat and same_cty and lastf.get("store"):
+                merged["store"] = lastf["store"]
+        else:
+            # merged ya trae store, pero si el usuario cambió
+            # cat/país sin mencionar tienda, eliminamos la tienda para no arrastrarla
+            if not (same_cat and same_cty):
+                merged.pop("store", None)
+
+    return merged
+
+
+
+def _filters_head(f: Dict) -> str:
+    return ("Filtros → "
+            f"país: {f.get('country') or '-'} | "
+            f"categoría: {f.get('category') or '-'} | "
+            f"tienda: {f.get('store') or '-'}")
+
+
+# Visualización — construcción de prompt para la API externa de gráficos
+
+def _viz_title(filters: Dict, intent: str, group_by: str | None = None) -> str:
+    cat = (filters or {}).get("category") or "productos"
+    cty = (filters or {}).get("country")
+    sto = (filters or {}).get("store")
+    loc = f" en {cty}" if cty else ""
+    if intent == "aggregate":
+        gb = {"store": "tienda", "country": "país", "category": "categoría"}.get(group_by or "", "grupo")
+        return f"Precio promedio de {cat} por {gb}{loc}"
+    if intent == "compare":
+        return f"Comparativa de precios de {cat}{loc}"
+    if sto:
+        return f"Precio de {cat}{loc} ({sto})"
+    return f"Precio de {cat}{loc}"
+
+def _viz_prompt_from_rows(rows: List[Dict], filters: Dict, *, title: str | None = None,
+                          max_n: int = 8, label_priority: List[str] = ["brand","name"]) -> str:
+    """
+    Construye un prompt NL + dataset JSON para una barra simple (label vs price).
+    El front/servicio de charts puede entender 'label' como eje X y 'value' como eje Y.
+    """
+    if not rows:
+        return ""
+    data = []
+    for r in rows[:max_n]:
+        label = None
+        for k in label_priority:
+            v = (r.get(k) or "").strip()
+            if v: label = v; break
+        if not label:
+            label = (r.get("name") or r.get("brand") or r.get("store") or r.get("product_id"))
+        if r.get("price") is None:
+            continue
+        data.append({
+            "label": label,
+            "value": float(r["price"]),
+            "currency": r.get("currency"),
+            "store": r.get("store"),
+            "brand": r.get("brand"),
+            "country": r.get("country"),
+            "product_id": r.get("product_id"),
+        })
+    if not data:
+        return ""
+    title = title or _viz_title(filters, "lookup")
+    nl = (
+        f"Genera una gráfica de barras titulada '{title}'. "
+        "Eje X: 'label'. Eje Y: 'value' (precio). "
+        "Usa el campo 'currency' solo para rotular si aplica. "
+        "Muestra etiquetas con 'brand' y 'store' cuando existan. "
+        f"Datos (JSON): {json.dumps(data, ensure_ascii=False)}"
+    )
+    return nl
+
+def _viz_prompt_from_agg(agg: Dict, filters: Dict, *, group_by: str) -> str:
+    """
+    Para agregados: usa el promedio como valor principal y pasa min/max para tooltips.
+    Schema: [{label, value, min, max}]
+    """
+    groups = (agg or {}).get("groups") or []
+    if not groups:
+        return ""
+    data = [{
+        "label": str(g.get("group")),
+        "value": float(g.get("avg")) if g.get("avg") is not None else None,
+        "min": float(g.get("min")) if g.get("min") is not None else None,
+        "max": float(g.get("max")) if g.get("max") is not None else None,
+    } for g in groups if g.get("group") is not None]
+    data = [d for d in data if d["value"] is not None]
+    if not data:
+        return ""
+    title = _viz_title(filters, "aggregate", group_by=group_by)
+    nl = (
+        f"Genera una gráfica de barras titulada '{title}'. "
+        f"Eje X: '{group_by}'. Eje Y: 'value' (precio promedio). "
+        "Incluye bandas o tooltips con 'min' y 'max' si el sistema lo soporta. "
+        f"Datos (JSON): {json.dumps(data, ensure_ascii=False)}"
+    )
+    return nl
+
+def _maybe_viz_prompt(intent: str, filters: Dict, *, rows: List[Dict] | None = None,
+                      agg: Dict | None = None, group_by: str | None = None, series: List[Dict] | None = None, ) -> str | None:
+    try:
+        if intent in ("lookup", "list", "compare") and rows:
+            return _viz_prompt_from_rows(rows, filters)
+        if intent == "aggregate" and agg and (agg.get("groups") or []):
+            gb = group_by or "category"
+            return _viz_prompt_from_agg(agg, filters, group_by=gb)
+        
+                # TOPN: construir barras con los top N (usa "rows")
+        if intent == "topn" and rows:
+            items = rows or []
+            data = [
+                {"label": (r.get("brand") or r.get("name") or "")[:18],
+                 "value": float(r.get("price") or 0.0)}
+                for r in items
+                if r.get("price") is not None
+            ]
+            return json.dumps({
+                "type": "bar",
+                "title": f"TOP {len(data)} por precio",
+                "x": "label",
+                "y": "value",
+                "data": data,
+                "unit": (items[0].get("currency") if items else None)
+            }, ensure_ascii=False)
+
+        # TREND: línea temporal con serie (usa "series")
+        if intent == "trend" and series:
+            points = [{"x": s.get("date"),
+                       "y": float(s.get("value") or 0.0)}
+                      for s in (series or []) if s.get("date")]
+            return json.dumps({
+                "type": "line",
+                "title": "Tendencia últimos días",
+                "x": "x",
+                "y": "y",
+                "data": points,
+                "unit": (series[-1].get("currency") if series else None)
+            }, ensure_ascii=False)
+
+
+    except Exception:
+        return None
+    return None
+
+
+
+def pick_effective_query(user_text: str, sid: Optional[str], prefer_last_cat: bool) -> str:
+    """
+    Si el turno no menciona categoría (prefer_last_cat=True), usamos la última
+    consulta de la sesión para mantener el 'tema' (p.ej. 'leche') y evitar
+    que embeddings 'adivinen' otra categoría.
+    """
+    if not sid:
+        return user_text
+    last = MEM.get(sid)
+    last_q = (last or {}).get("last_query")
+    if prefer_last_cat and last_q:
+        return last_q
+    return user_text
+
+def remember_session(session_id, *, filters, intent, query, hits):
+    last = MEM.get(session_id) or {}
+    lastf = dict(last.get("last_filters") or {})
+
+    # Solo pisa categoría si el turno la mencionó explícitamente o trae valor real
+    mentioned = last.get("last_mentioned") or {}  
+    if "category" in filters and filters.get("category"):
+        lastf["category"] = filters["category"]
+    elif mentioned and mentioned.get("category"):
+        lastf["category"] = filters.get("category")
+
+    
+    if "country" in filters and filters.get("country"):
+        lastf["country"] = filters["country"]
+    if "store" in filters:
+        lastf["store"] = filters.get("store")
+
+    MEM.set(session_id, {
+        **last,
+        "last_filters": lastf,
+        "last_intent": intent,
+        "last_query": query,
+        "last_mentioned": mentioned
+    })
+
+
+# Logging / Trazabilidad
+
+def _log_event(kind: str, payload: dict):
+    try:
+        os.makedirs("logs", exist_ok=True)
+        rec = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "kind": kind,
+            **payload
+        }
+        with open("logs/trace.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+
+def _now_ms():
+    return int(time.perf_counter() * 1000)
+
+def _log_perf(event: str, payload: dict):
+    """
+    Log compacto para consola y además a trace.jsonl.
+    """
+    try:
+        print(f"[PERF] {json.dumps({'kind': event, **payload}, ensure_ascii=False)}")
+    except Exception:
+        pass
+    _log_event(event, payload)
+
+
+
+
+
+# CORS / App
+
+app = FastAPI(title="RAG Pricing API", version="1.8.0")
+
+
+@app.on_event("startup")
+async def _warmup():
+    try:
+        # 1) Cargar colecciones Milvus
+        from pymilvus import Collection
+        from settings import get_settings
+        S = get_settings()
+        try:
+            Collection(getattr(S, "milvus_collection", "products_latam")).load()
+        except Exception:
+            pass
+        # Macro (si está en el mismo proceso)
+        try:
+            from retrieve_macro import _milvus_collection as _macro_coll
+            _macro_coll().load()
+        except Exception:
+            pass
+
+        # 2) Calentar LLMs y resolutores
+        try:
+            _ = llm_strict.generate("ok")
+        except Exception:
+            pass
+        try:
+            # Calentar embeddings del resolutor semántico de categoría
+            from category_resolver import resolve_category_semantic
+            _ = resolve_category_semantic("leche")
+        except Exception:
+            pass
+    except Exception:
+        # no romper inicio por warmup
+        pass
+
+
+
+
+@app.options("/chat/stream")
+def options_chat_stream():
+    # 204 vacío: el CORSMiddleware añadirá los headers CORS permitidos
+    return Response(status_code=204)
+
+
+
+origins = [
+    "http://localhost:5173",  # frontend local
+    "http://127.0.0.1:5173",  # a veces Vite usa 127.0.0.1
+    "http://localhost:8080",  # Lovable local
+    "http://localhost:8081",      
+    "http://127.0.0.1:8081",
+]
+
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Cliente LLM (Ollama)
+class OllamaLLM:
+    def __init__(self, model: str, base_url: str, temperature: float = 0.1,
+                 num_ctx: int = 2048, num_predict: int = 256, timeout: int = 120):
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.temperature = temperature
+        self.num_ctx = num_ctx
+        self.num_predict = num_predict
+        self.timeout = timeout
+
+    def generate(self, prompt: str) -> str:
+        try:
+            r = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": self.temperature,
+                        "num_ctx": self.num_ctx,
+                        "num_predict": self.num_predict,
+                    },
+                },
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            return (r.json().get("response") or "").strip()
+        except Exception:
+            return ""
+
+    def stream(self, prompt: str, min_chars: int = 40):
+        r = requests.post(
+            f"{self.base_url}/api/generate",
+            json={
+                "model": self.model,
+                "prompt": prompt,
+                "stream": True,
+                "options": {
+                    "temperature": self.temperature,
+                    "num_ctx": self.num_ctx,
+                    "num_predict": self.num_predict,
+                },
+            },
+            stream=True,
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        buf = ""
+        for line in r.iter_lines():
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line.decode("utf-8"))
+                if "response" in chunk:
+                    buf += chunk["response"]
+                    if len(buf) >= min_chars or buf.endswith((" ", ".", ",", ":", ";", "\n")):
+                        yield f"data: {buf}\n\n"; buf = ""
+                if chunk.get("done"):
+                    if buf: yield f"data: {buf}\n\n"
+                    yield "data: [FIN]\n\n"
+                    break
+            except Exception:
+                continue
+
+
+def _stream_no_fin(prompt: str, *, model=None):
+    """
+    Envuelve el stream del modelo y filtra un '[FIN]' que pudiera emitir.
+    Nunca se llama a sí misma.
+    """
+    m = model or llm_chat  
+    for chunk in m.stream(prompt):
+        # Asegura que trabajamos con str
+        if isinstance(chunk, (bytes, bytearray)):
+            s = chunk.decode("utf-8", errors="ignore")
+        else:
+            s = str(chunk)
+
+        # Filtrar un posible FIN que venga del modelo
+        if s.strip() == "data: [FIN]":
+            continue
+
+        # Ya viene con 'data: ...\n\n'
+        yield s
+
+
+
+
+llm_strict = OllamaLLM(
+    model=getattr(S, "gen_model", "phi3:mini"),
+    base_url=getattr(S, "ollama_host", "http://127.0.0.1:11434"),
+    temperature=0.0, num_ctx=1024, num_predict=128,
+)
+llm_chat = OllamaLLM(
+    model=getattr(S, "gen_model", "phi3:mini"),
+    base_url=getattr(S, "ollama_host", "http://127.0.0.1:11434"),
+    temperature=getattr(S, "gen_temperature", 0.35),
+    num_ctx=getattr(S, "gen_num_ctx", 2048),
+    num_predict=getattr(S, "gen_num_predict", 700),
+)
+
+def _llm_json(prompt: str) -> str:
+    return llm_strict.generate(prompt)
+
+
+# Root/health/runtime
+
+@app.get("/", tags=["root"])
+def root():
+    return {"ok": True, "name": "retail-rag-api", "mode": "read-only", "docs": "/docs"}
+
+@app.get("/health", tags=["health"])
+def health():
+    return {"ok": True}
+
+@app.get("/runtime", tags=["health"])
+def runtime():
+    return {
+        "gen_model": S.gen_model,
+        "ollama_host": S.ollama_host,
+        "embed_backend": S.embed_backend,
+        "embed_model": S.embed_model,
+    }
+
+
+# Prompts RAG
+
+
+def _prompt_lookup_from_facts(question: str, facts: dict, ctx: str) -> str:
+    """
+    Redacta TODO (saludo, frase contextual y explicación) usando SOLO los HECHOS.
+    Persona: asistente del Sistema de Pricing Inteligente , un sistema analítico que
+    extrae, limpia y entrega datos del retail en América Latina. No eres una tienda.
+    Estilo: profesional, cordial, conversacional; evita plantillas fijas.
+    Reglas:
+      - No inventes cifras ni marcas. No recomiendes visitar tiendas o webs externas.
+      - Si mencionas (n), es el número de registros usados, no "tiendas".
+      - Incluye SIEMPRE:
+          1) el promedio nacional (moneda y n),
+          2) un breve listado de promedios por marca (máx 8–10 ítems, con precio y n).
+      - Si faltan datos, dilo brevemente y ofrece filtrar o comparar dentro de la base.
+      - CIERRA SIEMPRE con un ÚLTIMO PÁRRAFO de “resumen + CTA”:
+        usa FACTS.brand_range si existe (≈min→≈max con marcas) y relaciónalo
+        con el promedio nacional; invita a filtrar por tienda, presentación o presupuesto.
+    """
+    import json
+    facts_json = json.dumps(facts, ensure_ascii=False)
+    return (
+        "Eres el asistente del *Sistema Pricing Inteligente*, una plataforma de analítica\n"
+        "que provee datos de retail para América Latina. Tu rol es analítico, no comercial.\n"
+        "Redacta en español, tono natural y claro, variando el saludo y la redacción.\n"
+        "Usa exclusivamente el bloque FACTS y, si te ayuda, algo del CONTEXTO; no inventes.\n"
+        "Incluye el promedio nacional y luego un listado compacto por marca; finalmente cierra con un\n"
+        "resumen breve y una invitación para seguir con filtros o comparaciones.\n"
+        f"Pregunta del usuario: {question}\n"
+        f"FACTS(JSON): {facts_json}\n"
+        f"CONTEXTO:\n{ctx}\n"
+        "Ahora redacta la respuesta completa."
+    )
+
+
+def _prompt_macro_humano(intent: str, facts: dict, hint_cta: str) -> str:
+    import json
+    return (
+        "Eres el asistente del Sistema de Pricing Inteligente (SPI). "
+        "Escribe en español, tono profesional y natural. "
+        "Responde en 3–6 frases de TEXTO PLANO: sin markdown, sin títulos, sin viñetas, "
+        "sin negritas (**), sin encabezados (#) y sin bloques de código. "
+        "NO muestres el JSON ni nombres de campos; úsalo solo como fuente. "
+        "Estructura: 1) saludo breve; 2) contexto (variable/país/es y fecha si aparece); "
+        "3) respuesta con las cifras del JSON; 4) cierre con un único call to action.\n"
+        f"FACTS(JSON): {json.dumps(facts, ensure_ascii=False)}\n"
+        f"Evita términos o marcadores como 'end_of_one_example'. "
+        f"CTA sugerido: {hint_cta}\n"
+        "Responde solo el texto final, sin JSON ni formato markdown."
+    )
+
+
+
+
+
+
+
+
+# Small-talk
+_GREET_PAT = re.compile(r"\b(hola|buen[oa]s?\s+d[ií]as|buenas?\s+tardes|buenas?\s+noches|hi|hello|hey)\b", re.I)
+_THANKS_PAT = re.compile(r"\b(gracias|thank(s)?|mil\s+gracias)\b", re.I)
+_BYE_PAT = re.compile(r"\b(chao|ad[ií]os|hasta\s+luego|bye)\b", re.I)
+_HELP_PAT = re.compile(r"\b(ayud(a|e|o)|como\s+funcion|puedo\s+(preguntar|usar)|help)\b", re.I)
+
+ASSISTANT_NAME = getattr(S, "assistant_name", "Asistente del Sistema Pricing Inteligente")
+
+# Palabras/rasgos que indican consulta de precios → NO smalltalk
+_DOMAIN_PAT = re.compile(
+    r"\b(precio|precios|cu[aá]nt(o|a)|vale|costo|coste|compar(a|ar)|promedio|media|mínimo|max(imo)|historial|tendenc|hoy|ahora)\b",
+    re.I
+)
+_CURRENCY_PAT = re.compile(r"(\$|€|£|¥|₱|₲|₡|R\$|S/\.|COP|ARS|CLP|PEN|MXN|BRL|USD|EUR)", re.I)
+
+def _is_smalltalk(text: str) -> Optional[str]:
+    t = (text or "").strip()
+    tl = t.lower()
+
+    # Si parece consulta de precios o ya detectamos filtros → no es smalltalk
+    try:
+        has_filters = bool(_guess_filters(t))
+    except Exception:
+        has_filters = False
+    if _DOMAIN_PAT.search(tl) or _CURRENCY_PAT.search(t) or has_filters:
+        return None
+
+    if _GREET_PAT.search(tl):  return "greeting"
+    if _THANKS_PAT.search(tl): return "thanks"
+    if _BYE_PAT.search(tl):    return "goodbye"
+    if _HELP_PAT.search(tl):   return "help"
+    return None
+
+
+# --- Conversación fluida: detectar pedidos de "ajuste de filtros" (refine) ---
+# Detecta: cambia / cámbialo / cambialo / cámbiame / ponlo / ajustalo / configura / setea / quita / sin ...
+# cerca de _is_smalltalk/_guess_filters
+_REFINE_PAT = re.compile(
+    r"\b("
+    r"cambi(?:a|á)(?:me|nos|lo|la)?|cambiar|"
+    r"pon(?:me|nos|lo|la)?|"
+    r"ajust(?:a|e)(?:me|nos|lo|la)?|ajúst(?:a|e)(?:me|nos|lo|la)?|"
+    r"usa|fija|configura|set(?:ea|ear)?|actualiza|define|"
+    r"quita|quitar|saca|sacar|"
+    r"háblame\s+de|hablame\s+de|ahora\s+en|y\s+en"
+    r")\b",
+    re.I
+)
+
+def _is_just_filters_command(text: str) -> bool:
+    t = _norm(text or "")
+    # Si pide datos explícitos, no es refine “silencioso”
+    if re.search(r"(precio|precios|promedio|media|tendencia|historia|serie|lista|listar|compara|comparar|top|gráfic|grafica)", t):
+        return False
+    heur = _guess_filters(text)
+    return any(heur.values())
+
+def _is_refine_command(text: str) -> bool:
+    return bool(_REFINE_PAT.search(_norm(text or "")) or _is_just_filters_command(text))
+
+
+
+
+# --- TOPN: detectar pedidos tipo "top 3 más baratos" o "los más caros" ---
+_TOP_PAT = re.compile(r"\btop\s*(\d+)\b", re.I)
+
+def _extract_topn(text: str) -> tuple[int, str]:
+    t = _norm(text or "")
+    m = _TOP_PAT.search(t)
+    n = int(m.group(1)) if m else 3
+    # cheap if says barato/menor/más bajo; else expensive
+    cheap = bool(re.search(r"barat|menor|minim|bajo", t))
+    mode = "cheap" if cheap else "expensive"
+    return max(min(n, 20), 1), mode
+
+def _is_topn_query(text: str) -> bool:
+    t = _norm(text or "")
+    return bool(_TOP_PAT.search(t) or re.search(r"\b(barat|car[oa]s|más\s+car[oa]s|más\s+barat)", t))
+
+# --- TREND: detectar “tendencia / últimos X días / evolución / serie” ---
+def _is_trend_query(text: str) -> bool:
+    t = _norm(text or "")
+    return any(k in t for k in ["tendencia", "últimos", "ultimo", "último", "evolución", "histor", "serie"])
+
+
+# --- STUB opcional: reemplázalo por tu implementación real ---
+def series_prices(filters: dict | None, days: int = 30) -> list[dict]:
+    """
+    Devuelve [{ "date": "YYYY-MM-DD", "value": float, "currency": "COP" }].
+    Sustituye este stub con tu consulta real (p.ej., tabla diaria).
+    """
+    try:
+        # Intento: si tienes 'list_by_filter_history' úsala; si no, retorna []
+        if 'list_by_filter_history' in globals():
+            rows = list_by_filter_history(filters or {}, days=days) or []
+            out = []
+            for r in rows:
+                if r.get("price") is None or not r.get("date"):
+                    continue
+                out.append({
+                    "date": str(r.get("date"))[:10],
+                    "value": float(r["price"]),
+                    "currency": r.get("currency") or None
+                })
+            # colapsar por fecha (promedio)
+            by_day = {}
+            for x in out:
+                d = x["date"]; by_day.setdefault(d, []).append(x["value"])
+            series = []
+            for d, vs in sorted(by_day.items()):
+                series.append({"date": d, "value": sum(vs)/max(len(vs),1), "currency": out[-1].get("currency") if out else None})
+            return series[-days:]
+        return []
+    except Exception:
+        return []
+
+
+
+
+def _prompt_smalltalk(user_msg: str, intent: str) -> str:
+    base_persona = (
+        f"Eres {ASSISTANT_NAME}. "
+        "Habla en tono cercano y breve (1–3 frases). "
+        "NO ofrezcas contactar proveedores, ni usar bases de datos externas, ni hacer cosas fuera del sistema. "
+        "Nunca inventes datos de productos ni precios."
+    )
+    seeds = {
+        "greeting": "Saluda de forma amable y ofrece ayuda para consultas de precios basadas en la base interna.",
+        "thanks":   "Agradece y ofrece seguir ayudando con consultas de precios basadas en la base.",
+        "goodbye":  "Despídete cordialmente.",
+        "help":     ("Explica en una frase que puedes responder preguntas de precios usando la base interna "
+                     "por categoría/país/tienda (p. ej., 'precio de azúcar en Colombia')."),
+    }
+    seed = seeds.get(intent, "Responde de forma amigable y ofrece ayuda dentro del sistema.")
+    return f"{base_persona}\nUsuario: {user_msg}\nInstrucción: {seed}\nRespuesta:"
+
+
+# -----------------------------------------------------------------------------
+# Modelos de request
+# -----------------------------------------------------------------------------
+
+
+class Plan(BaseModel):
+    intent: Literal["lookup","list","aggregate","compare","count"]
+    filters: Optional[Dict] = Field(default_factory=dict)
+    product_name: Optional[str] = None
+    product_name_b: Optional[str] = None
+    group_by: Optional[Literal["store","category","country"]] = None
+    operation: Optional[Literal["min","max","avg"]] = None
+    top_k: Optional[int] = 5
+    limit: Optional[int] = 100
+
+
+class ChatReqStream(BaseModel):
+    message: str
+    limit: Optional[int] = 100
+    session_id: Optional[str] = None
+
+# -----------------------------------------------------------------------------
+# Helpers planner
+# -----------------------------------------------------------------------------
+def _guess_filters(text: str) -> Dict:
+    nt = _norm(text)
+    f: Dict = {}
+    for alias, code in NCOUNTRIES.items():
+        if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", nt):
+            f["country"] = code; break
+    for alias, canon in NCATEGORIES.items():
+        if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", nt):
+            f["category"] = canon; break
+    for alias, canon in NSTORES.items():
+        if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", nt):
+            f["store"] = canon; break
+    return f
+
+
+# --- EXTRA: detectar N países mencionados (hasta 10) en orden de mención ---
+def _extract_countries(text: str, max_n: int = 10) -> list[str]:
+    """
+    Devuelve códigos ISO2 según NCOUNTRIES (alias normalizados → código),
+    en el orden en que aparecen en el texto (sin duplicados).
+    """
+    nt = _norm(text or "")
+    # NCOUNTRIES ya existe más arriba: { "colombia": "CO", "costa rica": "CR", ... }
+    keys = sorted(NCOUNTRIES.keys(), key=lambda s: -len(s))  # evita que "br" pise "brasil"
+    pat = r"(?<!\w)(" + "|".join(map(re.escape, keys)) + r")(?!\w)"
+    out: list[str] = []
+    for m in re.finditer(pat, nt):
+        code = NCOUNTRIES[m.group(1)]
+        if code not in out:
+            out.append(code)
+        if len(out) >= max_n:
+            break
+    return out
+
+
+def _fmt_row(r: dict, idx: int | None = None) -> str:
+    pres = f"{(r.get('size') or '')}{(r.get('unit') or '')}".strip() or "-"
+    prefix = f"{idx}. " if idx is not None else ""
+    return (
+        f"{prefix}{r.get('name')} · Marca: {r.get('brand')} · "
+        f"Pres: {pres} · Precio: {r.get('price')} {r.get('currency')} · "
+        f"Tienda: {r.get('store')} · País: {r.get('country')} "
+        f"[{r.get('product_id')}]"
+    )
+
+
+
+
+def _classify_intent_heuristic(text: str) -> str:
+    nt = _norm(text)
+    if ("precio" in nt or "precios" in nt) and ("producto" in nt or "productos" in nt):return "list"
+    if any(tok in nt for tok in ["comparar","compara","comparacion","vs","contra","frente a"]): return "compare"
+    if any(tok in nt for tok in ["promedio","media","minimo","máximo","maximo","promedio por","por tienda","por pais","por país","por categoría","por categoria"]): return "aggregate"
+    if any(tok in nt for tok in ["lista","listar","muestrame","mostrar","ver todos","todos los productos"]): return "list"
+    if any(tok in nt for tok in ["cuantos","cuántos","cuantas","cuántas","numero de","número de","cantidad","total de"]): return "count"
+    return "lookup"
+
+def _plan_from_llm(message: str) -> Optional[Plan]:
+    allowed_intents   = ["lookup","list","aggregate","compare","count"]
+    allowed_group_by  = ["store","category","country", None]
+    allowed_operation = ["min","max","avg", None]
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "intent": {"enum": allowed_intents},
+            "filters": {"type": "object"},
+            "product_name": {"type": ["string","null"]},
+            "product_name_b": {"type": ["string","null"]},
+            "group_by": {"enum": allowed_group_by},
+            "operation": {"enum": allowed_operation},
+            "top_k": {"type": "integer"},
+            "limit": {"type": "integer"}
+        },
+        "required": ["intent","filters"]
+    }
+    examples = [
+    ("muéstrame la leche en peru", {"intent":"list","filters":{"country":"PE","category":"leche_liquida"}}),
+    ("aceite vegetal 900ml en argentina", {"intent":"lookup","filters":{"country":"AR","category":"aceite_vegetal"}}),
+    ("¿cuántos productos hay en chile?", {"intent":"count","filters":{"country":"CL"}}),
+    ("promedio de precios por país para arroz", {"intent":"aggregate","group_by":"country","filters":{"category":"arroz"}}),
+    ]
+
+    prompt = (
+        "Devuelve SOLO un JSON que cumpla exactamente este esquema, sin texto extra.\n"
+        f"Esquema: {json.dumps(schema, ensure_ascii=False)}\n\n"
+        "- Normaliza country a ISO2 entre: MX, BR, AR, CO, CL, PE, EC, CR, PA, PY.\n"
+        "- category usa canónicos EXACTOS de Milvus: arroz, pan_de_molde, leche_liquida, leche, pasta_seca, azucar, cafe, cafe_molido, aceite_vegetal, huevo, pollo_entero, refrescos_de_cola, papa, frijol, harina_de_trigo, cerveza, queso_blando, atun, atun_en_lata, tomate, cebolla, manzana, banano, pan.\n"
+        "- Si el usuario pide \"leche\", normaliza a category=\"leche_liquida\".\n"
+        "- store devuelve nombre canónico si lo reconoces; si no, null.\n"
+        "- Si no estás seguro, deja null o filters vacío.\n\n"
+        "Ejemplos:\n" +
+        "\n".join([f"Usuario: {u}\nPlan: {json.dumps(p, ensure_ascii=False)}" for u,p in examples]) +
+        f"\n\nUsuario: {message}\nPlan:"
+    )
+    txt = _llm_json(prompt).strip()
+    m = re.search(r"\{.*\}", txt, re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+        if "intent" not in data or data["intent"] not in allowed_intents:
+            return None
+        data.setdefault("filters", {})
+        data["filters"] = sanitize_filters(data["filters"])
+        return Plan(**data)
+    except Exception:
+        return None
+
+    
+
+# -----------------------------------------------------------------------------
+# /chat (planner + memoria + comparaciones inteligentes)
+# -----------------------------------------------------------------------------
+def _build_ctx(hits: List[Dict], k: int) -> str:
+    return "\n".join(
+        f"[{h['product_id']}] {h['name']} | Marca: {h['brand']} | "
+        f"Pres: {h['size']}{h['unit']} | Precio: {h['price']} {h['currency']} | "
+        f"Tienda: {h['store']} | País: {h['country']}"
+        for h in hits[:k]
+    )
+
+
+
 # -----------------------------------------------------------------------------
 # /chat/stream (memoria + encabezado de filtros)
 # -----------------------------------------------------------------------------
@@ -151,63 +1416,6 @@ def chat_stream(req: ChatReqStream):
                 yield "data: [FIN]\n\n"
 
             return StreamingResponse(gen_super(), media_type="text/event-stream")
-
-
-
-
-
-            
-                    # --- Superlativos macro: “¿qué país tiene X más alto/bajo?”
-        superl = _is_macro_superlative_query(text)
-        if superl and macros and "__ALL__" not in macros:
-            var = macros[0]  # ya viene canónico por MACRO_ALIASES
-
-            cs = getattr(S, "countries", None)
-            if not cs:
-                cs = sorted({v for v in COUNTRY_ALIASES.values() if isinstance(v, str) and len(v) == 2})
-
-            rows = macro_compare(var, cs) or []
-            if not rows:
-                reason = _diagnose_no_results("macro_compare", plan=None, text=text, macros=macros, rows=rows)
-                return StreamingResponse(_sse_no_data_ex(reason, {"country": cs}), media_type="text/event-stream")
-
-            key = lambda r: float(r.get("value") or 0.0)
-            best = (max(rows, key=key) if superl == "max" else min(rows, key=key))
-
-            def gen_super():
-                yield f"data: Filtros → variable: {var} | países: {' | '.join(cs)}\n\n"
-                facts = {
-                    "type": "macro_compare",
-                    "variable": var,
-                    "countries": cs,
-                    "rows": [
-                        {"country": x.get("country"), "name": x.get("name"),
-                        "value": x.get("value"), "unit": x.get("unit"), "date": x.get("date")}
-                        for x in rows
-                    ],
-                    "winner": {
-                        "mode": "máximo" if superl == "max" else "mínimo",
-                        "country": best.get("country"),
-                        "value": best.get("value"),
-                        "unit": best.get("unit"),
-                        "date": best.get("date"),
-                        "name": best.get("name"),
-                    },
-                }
-                prompt = _prompt_macro_humano(
-                    "macro_compare",
-                    facts,
-                    "¿Quieres que agregue otro país o ver la serie histórica?"
-                )
-                for chunk in _stream_no_fin(prompt):
-                    yield chunk
-                yield "data: [FIN]\n\n"
-
-            return StreamingResponse(gen_super(), media_type="text/event-stream")
-
-
-
-
 
 
         # ¿hay intención de productos en este mismo turno?
@@ -1200,3 +2408,29 @@ def chat_stream(req: ChatReqStream):
         yield "data: [FIN]\n\n"
 
     return StreamingResponse(gen_lookup(), media_type="text/event-stream")
+
+
+# -----------------------------------------------------------------------------
+# Feedback
+# -----------------------------------------------------------------------------
+class FeedbackReq(BaseModel):
+    message: str
+    reply: str
+    rating: Literal["up","down"]
+    comment: Optional[str] = None
+    planner: Optional[Dict] = None
+
+@app.post("/feedback", tags=["meta"])
+def feedback(req: FeedbackReq):
+    rec = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "message": req.message,
+        "reply": req.reply,
+        "rating": req.rating,
+        "comment": req.comment,
+        "planner": req.planner,
+    }
+    os.makedirs("logs", exist_ok=True)
+    with open("logs/feedback.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return {"ok": True}
