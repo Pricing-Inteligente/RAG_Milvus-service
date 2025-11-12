@@ -1313,6 +1313,55 @@ def _extract_countries(text: str, max_n: int = 10) -> list[str]:
             break
     return out
 
+# --- MULTI-QUERIES: n consultas en un mismo string ---------------------------
+_MULTI_SEP = re.compile(r"\s*(?:,|;|\by(?:\s+tamb[ií]en)?\b|\btamb[ií]en\b|\badem[aá]s\b)\s+", re.I)
+
+def _extract_subqueries(text: str) -> list[dict]:
+    """
+    Intenta extraer múltiples consultas homogéneas del mismo string.
+    Soporta patrones sencillos del tipo:
+      - 'costo de vida en Brasil' / 'IPC Colombia'
+      - 'precio del arroz en Colombia' / 'café en Brasil'
+    Devuelve una lista ordenada de dicts como:
+      {'type':'macro','var':'cpi','countries':['BR']}
+      {'type':'product','filters':{'category':'arroz','country':'CO'}}
+    """
+    out: list[dict] = []
+    if not text:
+        return out
+    parts = _MULTI_SEP.split(text)
+
+    for raw in parts:
+        s = raw.strip()
+        if not s:
+            continue
+        nt = _norm(s)
+
+        # --- macro? (usa alias ya definidos en NMACROS)
+        macs = [NMACROS[a] for a in NMACROS.keys() if re.search(rf"(?<!\w){re.escape(a)}(?!\w)", nt)]
+        countries = _extract_countries(s, max_n=3)
+        if macs:
+            # prioriza una variable concreta si aparece, si no deja la primera
+            var = next((m for m in macs if m != "__ALL__"), macs[0])
+            out.append({"type": "macro", "var": var, "countries": countries[:2] or []})
+            continue
+
+        # --- productos? (alias → categoría canónica con NCATEGORIES)
+        cat = None
+        for alias, canon in NCATEGORIES.items():
+            if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", nt):
+                cat = canon
+                break
+        if cat:
+            ctys = _extract_countries(s, max_n=2)
+            out.append({"type": "product", "filters": {"category": cat, "country": ctys[0] if ctys else None}})
+            continue
+
+    return [q for q in out if q]
+
+
+
+
 
 def _fmt_row(r: dict, idx: int | None = None) -> str:
     pres = f"{(r.get('size') or '')}{(r.get('unit') or '')}".strip() or "-"
@@ -1508,7 +1557,198 @@ def chat_stream(req: ChatReqStream):
 
 
 
-    
+        # --- N consultas en un mismo string (separadas por ',' 'y' 'también') ---
+    subs = _extract_subqueries(text)
+    if len(subs) >= 2:
+
+        def gen_multi():
+            for i, q in enumerate(subs, 1):
+                # ======================
+                #   1) MACRO
+                # ======================
+                if q["type"] == "macro":
+                    var = q.get("var")
+                    cs  = q.get("countries") or []
+
+                    # -- Comparación multi-país
+                    if var and len(cs) >= 2:
+                        rows = macro_compare(var, cs) or []
+                        
+                        yield f"data: [MACRO] variable: {var} | países: {' | '.join(cs)}\n\n"
+                        for j, r in enumerate((rows or [])[:5], 1):
+                            yield f"data: {j}. {r.get('country')}: {r.get('value')} {r.get('unit') or ''} ({r.get('date') or ''})\n\n"
+                        # Redacción humana (macro_compare)
+                        facts = {
+                            "type": "macro_compare",
+                            "variable": var,
+                            "countries": cs,
+                            "rows": [
+                                {"country": x.get("country"), "name": x.get("name"),
+                                 "value": x.get("value"), "unit": x.get("unit"),
+                                 "date": x.get("date")}
+                                for x in (rows or [])
+                            ]
+                        }
+                        sub_text = f"compara {var} entre {', '.join(cs)} — resume en 2–3 líneas."
+                        prompt = _prompt_macro_humano("macro_compare", facts, "¿Agregar otro país o variable?")
+                        for chunk in _stream_no_fin(prompt):
+                            yield chunk
+                        yield "data: \n\n"
+
+                        # Mini tabla factual (máx 5)
+                        for j, r in enumerate(rows[:5], 1):
+                            yield f"data: {j}. {r.get('country')}: {r.get('value')} {r.get('unit') or ''} ({r.get('date') or ''})\n\n"
+                        yield "data: \n\n"
+                        continue
+
+                    # -- Lookup 1 país
+                    if var and len(cs) == 1:
+                        r = macro_lookup(var, cs[0])
+                        if r:
+                            yield f"data: [MACRO] País: {cs[0]} | variable: {var}\n\n"
+                            yield f"data: {_fmt_macro_row(r)}\n\n"
+                            facts = {
+                                "type": "macro_lookup",
+                                "variable": var,
+                                "country": cs[0],
+                                "row": {"country": r.get("country"), "name": r.get("name"),
+                                        "value": r.get("value"), "unit": r.get("unit"),
+                                        "date": r.get("date")}
+                            }
+                            prompt = _prompt_macro_humano("macro_lookup", facts, "¿Ver serie temporal o comparar con otro país?")
+                            for chunk in _stream_no_fin(prompt):
+                                yield chunk
+                            yield "data: \n\n"
+                            
+                        else:
+                            yield f"data: No hallé datos macro para {var} en {cs[0]}.\n\n"
+                        yield "data: \n\n"
+                        continue
+
+                    yield "data: Para variables macro necesito el país (ej.: 'IPC en CO').\n\n"
+                    yield "data: \n\n"
+                    continue
+
+                # ======================
+                #   2) PRODUCTOS (lookup)
+                # ======================
+                if q["type"] == "product":
+                    from collections import Counter
+                    f = {k: v for k, v in (q.get('filters') or {}).items() if v}
+                    rows = list_by_filter(f, limit=min(getattr(S, 'chat_list_default', 500), 40)) or []
+
+                    yield f"data: [PRODUCTOS] Filtros → {f}\n\n"
+
+                    # 1) Redacción humana primero (usa sub_text de la cláusula)
+                    sub_text = f"precio de {f.get('category')} en {f.get('country')} — resume en 3–5 líneas, tono claro, sin muletillas."
+                    prompt = _prompt_lookup_from_facts(sub_text, facts, ctx)
+                    for chunk in _stream_no_fin(prompt):
+                        yield chunk
+                    yield "data: \n\n"
+
+                    # 2) VIZ_PROMPT (si aplica)
+                    if vizp:
+                        yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+
+                    # 3) Lista compacta (máx 10)
+                    for j, r in enumerate(rows[:10], 1):
+                        yield f"data: {_fmt_row(r, j)}\n\n"
+                    yield "data: \n\n"
+
+
+
+
+
+                    # --- Construcción de FACTS (como en lookup) ---
+                    facts_filters = dict(f)
+                    hits = rows[:min(20, len(rows))]
+                    ctx = _build_ctx(hits, 10)
+
+                    base_filters = dict(facts_filters)
+                    base_filters.pop("store", None)  # promedio nacional sin tienda
+
+                    rows_all = list_by_filter(base_filters, limit=min(getattr(S, "aggregate_limit", 5000), 5000))
+                    prices = [r.get("price") for r in rows_all if r.get("price") is not None]
+
+                    cur = None
+                    if rows_all:
+                        cur = Counter([r.get("currency") for r in rows_all if r.get("currency")]).most_common(1)[0][0]
+
+                    avg_all = (sum(prices) / max(len(prices), 1)) if prices else None
+
+                    # Promedios por marca
+                    agg_brand = aggregate_prices(base_filters, by="brand")
+                    groups = agg_brand.get("groups") or []
+                    groups = [g for g in groups if g and g.get("group") not in (None, "", "N/A") and g.get("avg") is not None]
+
+                    # Fallback a partir de hits si no hubo grupos en BD
+                    if not groups and hits:
+                        tmp_sum, tmp_n = {}, {}
+                        for h in hits:
+                            b, p = (h.get("brand") or "N/A"), h.get("price")
+                            if p is None: continue
+                            tmp_sum[b] = tmp_sum.get(b, 0) + p
+                            tmp_n[b]   = tmp_n.get(b, 0) + 1
+                        groups = [{"group": b, "avg": tmp_sum[b] / tmp_n[b], "count": tmp_n[b]} for b in tmp_sum.keys()]
+
+                    brands = sorted(
+                        [{"brand": g["group"], "avg": g["avg"], "count": g.get("count") or g.get("n") or 0} for g in groups],
+                        key=lambda x: -x["count"]
+                    )[:10]
+
+                    brand_range = None
+                    if brands:
+                        lo = min(brands, key=lambda b: b["avg"])
+                        hi = max(brands, key=lambda b: b["avg"])
+                        brand_range = {"min_brand": lo["brand"], "min_avg": lo["avg"],
+                                       "max_brand": hi["brand"], "max_avg": hi["avg"]}
+
+                    facts = {
+                        "country": f.get("country"),
+                        "category": f.get("category"),
+                        "currency": cur,
+                        "national_avg": float(avg_all) if avg_all is not None else None,
+                        "n": len(prices),
+                        "brands": brands,
+                        "brand_range": brand_range,
+                    }
+
+                    # (Opcional) gráfico si aplica
+                    try:
+                        vizp = _maybe_viz_prompt("lookup", f, rows=rows)
+                    except NameError:
+                        vizp = None
+                    if vizp:
+                        yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+
+                    # Redacción humana (lookup)
+                    prompt = _prompt_lookup_from_facts(text, facts, ctx)
+                    for chunk in _stream_no_fin(prompt):
+                        yield chunk
+                    yield "data: \n\n"
+
+                    # Lista compacta (máx 10) para transparencia
+                    for j, r in enumerate(rows[:10], 1):
+                        yield f"data: {_fmt_row(r, j)}\n\n"
+
+                    # Memoria mínima por subconsulta (sin CTA adicional para evitar duplicados)
+                    try:
+                        remember_session(req.session_id, filters=f, intent="list",
+                                         query=text, hits=len(rows),
+                                         mentioned=_detect_mentions_from_text(text))
+                    except Exception:
+                        pass
+
+                    yield "data: \n\n"
+
+            # Cierre único para todo el combo
+            yield "data: [FIN]\n\n"
+
+        return StreamingResponse(gen_multi(), media_type="text/event-stream")
+
+
+
+
         # ------ RUTA MACRO (stream) ------
     macros = _extract_macros(text)
     if macros:
