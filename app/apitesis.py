@@ -64,38 +64,58 @@ _NON_MX_REGEX = re.compile(
 _MX_REGEX = re.compile(r"\b(m[eé]xico|mx)\b", flags=re.IGNORECASE)
 
 
+def _clean_term(t: str) -> str:
+    t = (t or "").lower()
+    t = re.sub(r"\s+", " ", t).strip(" ._-")
+    t = re.sub(r"^(el|la|los|las)\s+", "", t)
+    return t
+
+def _extract_pair(text: str) -> tuple[str, str] | None:
+    # separadores: y / vs / contra
+    sep = r"(?:y|vs\.?|contra)"
+    # 1) "marca <A> y <B>"
+    m = re.search(r"marca\s+([a-z0-9_áéíóúñ\-\s]+?)\s*"+sep+r"\s*([a-z0-9_áéíóúñ\-\s]+)", text, re.IGNORECASE)
+    if m: return (_clean_term(m.group(1)), _clean_term(m.group(2)))
+    # 2) "entre <A> y <B> de/en méxico"
+    m = re.search(r"entre\s+(?:el|la|los|las)?\s*([a-z0-9_áéíóúñ\-\s]+?)\s*"+sep+r"\s*(?:el|la|los|las)?\s*([a-z0-9_áéíóúñ\-\s]+?)\s+(?:de|en)\s+m[eé]xico\b", text, re.IGNORECASE)
+    if m: return (_clean_term(m.group(1)), _clean_term(m.group(2)))
+    # 3) genérico "entre <A> y <B>"
+    m = re.search(r"entre\s+([a-z0-9_áéíóúñ\-\s]+?)\s*"+sep+r"\s*([a-z0-9_áéíóúñ\-\s]+)", text, re.IGNORECASE)
+    if m: return (_clean_term(m.group(1)), _clean_term(m.group(2)))
+    return None
+
 def detect_lasso_influence_intent(message: str) -> dict | None:
     text = (message or "").strip().lower()
-    if not any(k in text for k in LASSO_KEYWORDS):
+    if not any(k in text for k in LASSO_KEYWORDS | {"comparar", "comparación", "comparacion"}):
         return None
 
-    # Bloquea solo si se menciona otro país y NO aparece MX
+    # Bloquea solo si mencionan otro país y NO MX
     if _NON_MX_REGEX.search(text) and not _MX_REGEX.search(text):
         return {"intent": "lasso_influence_blocked_non_mx"}
 
-    # --- 1) MARCA explícita ---
+    # ¿comparación?
+    pair = _extract_pair(text)
+    if pair:
+        by = "brand" if "marca" in text else "product"
+        a, b = pair
+        return {"intent": "lasso_compare", "by": by, "term_a": a, "term_b": b}
+
+    # Caso 1 término (marca explícita)
     m = re.search(r"(?:de\s+la\s+marca|de\s+marca|marca)\s+([a-z0-9\-\.\s_]+)", text, flags=re.IGNORECASE)
     if m:
-        term = re.sub(r"\s+", " ", m.group(1)).strip(" ._-")
+        term = _clean_term(m.group(1))
         return {"intent": "lasso_influence", "by": "brand", "term": term}
 
-    # --- 2) PRODUCTO: “en/sobre <producto> de/en méxico” (captura solo el producto)
-    m3 = re.search(
-        r"(?:en|sobre)\s+(?:el|la|los|las)?\s*([a-z0-9_áéíóúñ\-\s]+?)\s+(?:de|en)\s+m[eé]xico\b",
-        text, flags=re.IGNORECASE
-    )
+    # Producto: “en/sobre <producto> de/en méxico”
+    m3 = re.search(r"(?:en|sobre)\s+(?:el|la|los|las)?\s*([a-z0-9_áéíóúñ\-\s]+?)\s+(?:de|en)\s+m[eé]xico\b", text, flags=re.IGNORECASE)
     if m3:
-        term = re.sub(r"\s+", " ", m3.group(1)).strip(" ._-")
+        term = _clean_term(m3.group(1))
         return {"intent": "lasso_influence", "by": "product", "term": term}
 
-    # --- 3) FALLBACK: toma lo previo a “de/en méxico”, pero reduce al último token tipo “arroz” ---
+    # Fallback: toma lo previo a “de/en méxico”
     m2 = re.search(r"([a-z0-9\-\.\s_]+?)\s+(?:de|en)\s+m[eé]xico\b", text, flags=re.IGNORECASE)
-    raw = re.sub(r"\s+", " ", (m2.group(1) if m2 else text)).strip(" ._-")
-    # quita artículos y quédate con la última palabra útil
-    tokens = [t for t in re.split(r"\s+", raw) if t not in {"de","en","la","el","las","los"}]
-    term = tokens[-1] if tokens else raw
-
-    return {"intent": "lasso_influence", "by": "product", "term": term}
+    raw = _clean_term(m2.group(1) if m2 else text)
+    return {"intent": "lasso_influence", "by": "product", "term": raw}
 
 
 
@@ -1183,6 +1203,12 @@ def _cta_options(intent: str, facts: dict) -> list[str]:
             "¿Te muestro la descomposición para otra presentación del producto?",
             "¿Simulamos un what-if sencillo (por ejemplo, +1 pp en inflación)?",
         ]
+    if intent == "lasso_compare":
+        return [
+            "¿Quieres que grafique las influencias lado a lado?",
+            "¿Probamos con otras dos marcas o productos?",
+            "¿Simulamos un what-if para ambas (por ejemplo, +1 pp en inflación)?",
+        ]
 
     return ["¿Quieres que profundice?"]
 
@@ -1259,6 +1285,27 @@ def _prompt_lasso_humano(facts: dict, hint_cta: str | None = None, include_cta: 
     else:
         base += " No incluyas CTA."
     return base + f"\nHECHOS(JSON): {json.dumps(facts, ensure_ascii=False)}\nRespuesta:"
+
+
+
+
+def _prompt_lasso_compare_humano(facts: dict, hint_cta: str | None = None, include_cta: bool = True) -> str:
+    import json
+    base = (
+        "Eres el asistente del SPI. Español, tono cercano y profesional. "
+        "Devuelve 4–7 frases en TEXTO PLANO (sin markdown). "
+        "Estructura: 1) saludo breve y contexto: comparación de influencias con LASSO en México; "
+        "2) compara A vs B resaltando las 2–3 variables con MAYOR diferencia de magnitud absoluta entre ambos; "
+        "3) interpreta el signo: positivo sube el precio, negativo lo reduce; "
+        "4) cierra mencionando R² y alfa de cada uno y cita la descripción y retail de ambos. "
+        "No inventes nada que no esté en HECHOS."
+    )
+    if include_cta and hint_cta:
+        base += f" Termina con un único CTA: {hint_cta}"
+    else:
+        base += " No incluyas CTA."
+    return base + f"\nHECHOS(JSON): {json.dumps(facts, ensure_ascii=False)}\nRespuesta:"
+
 
 
 
@@ -1717,198 +1764,11 @@ def chat_stream(req: ChatReqStream):
 
 
 
-        # --- N consultas en un mismo string (separadas por ',' 'y' 'también') ---
-    subs = _extract_subqueries(text)
-    if len(subs) >= 2:
-
-        def gen_multi():
-            for i, q in enumerate(subs, 1):
-                # ======================
-                #   1) MACRO
-                # ======================
-                if q["type"] == "macro":
-                    var = q.get("var")
-                    cs  = q.get("countries") or []
-
-                    # -- Comparación multi-país
-                    if var and len(cs) >= 2:
-                        rows = macro_compare(var, cs) or []
-                        
-                        yield f"data: [MACRO] variable: {var} | países: {' | '.join(cs)}\n\n"
-                        for j, r in enumerate((rows or [])[:5], 1):
-                            yield f"data: {j}. {r.get('country')}: {r.get('value')} {r.get('unit') or ''} ({r.get('date') or ''})\n\n"
-                        # Redacción humana (macro_compare)
-                        facts = {
-                            "type": "macro_compare",
-                            "variable": var,
-                            "countries": cs,
-                            "rows": [
-                                {"country": x.get("country"), "name": x.get("name"),
-                                 "value": x.get("value"), "unit": x.get("unit"),
-                                 "date": x.get("date")}
-                                for x in (rows or [])
-                            ]
-                        }
-                        sub_text = f"compara {var} entre {', '.join(cs)} — resume en 2–3 líneas."
-                        prompt = _prompt_macro_humano("macro_compare", facts, "¿Agregar otro país o variable?")
-                        for chunk in _stream_no_fin(prompt):
-                            yield chunk
-                        yield "data: \n\n"
-
-                        # Mini tabla factual (máx 5)
-                        for j, r in enumerate(rows[:5], 1):
-                            yield f"data: {j}. {r.get('country')}: {r.get('value')} {r.get('unit') or ''} ({r.get('date') or ''})\n\n"
-                        yield "data: \n\n"
-                        continue
-
-                    # -- Lookup 1 país
-                    if var and len(cs) == 1:
-                        r = macro_lookup(var, cs[0])
-                        if r:
-                            yield f"data: [MACRO] País: {cs[0]} | variable: {var}\n\n"
-                            yield f"data: {_fmt_macro_row(r)}\n\n"
-                            facts = {
-                                "type": "macro_lookup",
-                                "variable": var,
-                                "country": cs[0],
-                                "row": {"country": r.get("country"), "name": r.get("name"),
-                                        "value": r.get("value"), "unit": r.get("unit"),
-                                        "date": r.get("date")}
-                            }
-                            prompt = _prompt_macro_humano("macro_lookup", facts, "¿Ver serie temporal o comparar con otro país?")
-                            for chunk in _stream_no_fin(prompt):
-                                yield chunk
-                            yield "data: \n\n"
-                            
-                        else:
-                            yield f"data: No hallé datos macro para {var} en {cs[0]}.\n\n"
-                        yield "data: \n\n"
-                        continue
-
-                    yield "data: Para variables macro necesito el país (ej.: 'IPC en CO').\n\n"
-                    yield "data: \n\n"
-                    continue
-
-                # ======================
-                #   2) PRODUCTOS (lookup)
-                # ======================
-                if q["type"] == "product":
-                    from collections import Counter
-                    f = {k: v for k, v in (q.get('filters') or {}).items() if v}
-                    rows = list_by_filter(f, limit=min(getattr(S, 'chat_list_default', 500), 40)) or []
-
-                    yield f"data: [PRODUCTOS] Filtros → {f}\n\n"
-
-                    # 1) Redacción humana primero (usa sub_text de la cláusula)
-                    sub_text = f"precio de {f.get('category')} en {f.get('country')} — resume en 3–5 líneas, tono claro, sin muletillas."
-                    prompt = _prompt_lookup_from_facts(sub_text, facts, ctx)
-                    for chunk in _stream_no_fin(prompt):
-                        yield chunk
-                    yield "data: \n\n"
-
-                    # 2) VIZ_PROMPT (si aplica)
-                    if vizp:
-                        yield f"data: [VIZ_PROMPT] {vizp}\n\n"
-
-                    # 3) Lista compacta (máx 10)
-                    for j, r in enumerate(rows[:10], 1):
-                        yield f"data: {_fmt_row(r, j)}\n\n"
-                    yield "data: \n\n"
 
 
 
 
 
-                    # --- Construcción de FACTS (como en lookup) ---
-                    facts_filters = dict(f)
-                    hits = rows[:min(20, len(rows))]
-                    ctx = _build_ctx(hits, 10)
-
-                    base_filters = dict(facts_filters)
-                    base_filters.pop("store", None)  # promedio nacional sin tienda
-
-                    rows_all = list_by_filter(base_filters, limit=min(getattr(S, "aggregate_limit", 5000), 5000))
-                    prices = [r.get("price") for r in rows_all if r.get("price") is not None]
-
-                    cur = None
-                    if rows_all:
-                        cur = Counter([r.get("currency") for r in rows_all if r.get("currency")]).most_common(1)[0][0]
-
-                    avg_all = (sum(prices) / max(len(prices), 1)) if prices else None
-
-                    # Promedios por marca
-                    agg_brand = aggregate_prices(base_filters, by="brand")
-                    groups = agg_brand.get("groups") or []
-                    groups = [g for g in groups if g and g.get("group") not in (None, "", "N/A") and g.get("avg") is not None]
-
-                    # Fallback a partir de hits si no hubo grupos en BD
-                    if not groups and hits:
-                        tmp_sum, tmp_n = {}, {}
-                        for h in hits:
-                            b, p = (h.get("brand") or "N/A"), h.get("price")
-                            if p is None: continue
-                            tmp_sum[b] = tmp_sum.get(b, 0) + p
-                            tmp_n[b]   = tmp_n.get(b, 0) + 1
-                        groups = [{"group": b, "avg": tmp_sum[b] / tmp_n[b], "count": tmp_n[b]} for b in tmp_sum.keys()]
-
-                    brands = sorted(
-                        [{"brand": g["group"], "avg": g["avg"], "count": g.get("count") or g.get("n") or 0} for g in groups],
-                        key=lambda x: -x["count"]
-                    )[:10]
-
-                    brand_range = None
-                    if brands:
-                        lo = min(brands, key=lambda b: b["avg"])
-                        hi = max(brands, key=lambda b: b["avg"])
-                        brand_range = {"min_brand": lo["brand"], "min_avg": lo["avg"],
-                                       "max_brand": hi["brand"], "max_avg": hi["avg"]}
-
-                    facts = {
-                        "country": f.get("country"),
-                        "category": f.get("category"),
-                        "currency": cur,
-                        "national_avg": float(avg_all) if avg_all is not None else None,
-                        "n": len(prices),
-                        "brands": brands,
-                        "brand_range": brand_range,
-                    }
-
-                    # (Opcional) gráfico si aplica
-                    try:
-                        vizp = _maybe_viz_prompt("lookup", f, rows=rows)
-                    except NameError:
-                        vizp = None
-                    if vizp:
-                        yield f"data: [VIZ_PROMPT] {vizp}\n\n"
-
-                    # Redacción humana (lookup)
-                    prompt = _prompt_lookup_from_facts(text, facts, ctx)
-                    for chunk in _stream_no_fin(prompt):
-                        yield chunk
-                    yield "data: \n\n"
-
-                    # Lista compacta (máx 10) para transparencia
-                    for j, r in enumerate(rows[:10], 1):
-                        yield f"data: {_fmt_row(r, j)}\n\n"
-
-                    # Memoria mínima por subconsulta (sin CTA adicional para evitar duplicados)
-                    try:
-                        remember_session(req.session_id, filters=f, intent="list",
-                                         query=text, hits=len(rows),
-                                         mentioned=_detect_mentions_from_text(text))
-                    except Exception:
-                        pass
-
-                    yield "data: \n\n"
-
-            # Cierre único para todo el combo
-            yield "data: [FIN]\n\n"
-
-        return StreamingResponse(gen_multi(), media_type="text/event-stream")
-
-
-    # --- LASSO: influencia/descomposición solo para México ---
-    # --- LASSO: influencia/descomposición solo para México ---
     lasso_plan = detect_lasso_influence_intent(text)
     if lasso_plan:
         if lasso_plan.get("intent") == "lasso_influence_blocked_non_mx":
@@ -1917,6 +1777,105 @@ def chat_stream(req: ChatReqStream):
                 yield "data: ¿Busco la influencia para ese producto o marca en México?\n\n"
                 yield "data: [FIN]\n\n"
             return StreamingResponse(gen_block(), media_type="text/event-stream")
+        
+
+         # ===== NUEVO: COMPARACIÓN =====
+        if lasso_plan.get("intent") == "lasso_compare":
+            by = lasso_plan["by"]
+            a, b = lasso_plan["term_a"], lasso_plan["term_b"]
+            rows_a = query_lasso_models(by, a, topk=3)
+            rows_b = query_lasso_models(by, b, topk=3)
+
+            if not rows_a or not rows_b:
+                def gen_missing():
+                    yield "data: Filtros → país: MX | categoría: - | tienda: -\n\n"
+                    miss = []
+                    if not rows_a: miss.append(a)
+                    if not rows_b: miss.append(b)
+                    yield f"data: No encontré modelos para: {', '.join(miss)}. ¿Quieres intentar con otros términos?\n\n"
+                    yield "data: [FIN]\n\n"
+                return StreamingResponse(gen_missing(), media_type="text/event-stream")
+
+            A = max(rows_a, key=lambda r: (r.get("r_squared") or 0.0))
+            B = max(rows_b, key=lambda r: (r.get("r_squared") or 0.0))
+
+            def pick_coefs(r: dict) -> list[dict]:
+                keys = [
+                    ("Inflación general (%)",          "coef_inflation_rate_pct_change"),
+                    ("Tipo de cambio USD/MXN (%)",     "coef_cambio_dolar_pct_change"),
+                    ("CPI / IPC (%)",                  "coef_cpi_pct_change"),
+                    ("Tasa de interés (%)",            "coef_interest_rate_pct_change"),
+                    ("PIB (%)",                        "coef_gdp_pct_change"),
+                    ("Precios al productor (%)",       "coef_producer_prices_pct_change"),
+                    ("Índice Gini (%)",                "coef_gini_pct_change"),
+                ]
+                out = []
+                for label, k in keys:
+                    v = r.get(k)
+                    if v is not None:
+                        out.append({"name": label, "value": float(v)})
+                # ordenar por magnitud
+                out.sort(key=lambda c: abs(c["value"]), reverse=True)
+                return out
+
+            facts_compare = {
+                "type": "lasso_compare",
+                "by": by,
+                "country": "MX",
+                "A": {
+                    "term": a,
+                    "product_desc": A.get("nombre"),
+                    "brand": A.get("marca"),
+                    "product": A.get("producto"),
+                    "retail": A.get("retail"),
+                    "r2": float(A.get("r_squared") or 0.0),
+                    "alpha": float(A.get("best_alpha") or 0.0),
+                    "n_obs": int(A.get("n_obs") or 0),
+                    "coefs": pick_coefs(A),
+                },
+                "B": {
+                    "term": b,
+                    "product_desc": B.get("nombre"),
+                    "brand": B.get("marca"),
+                    "product": B.get("producto"),
+                    "retail": B.get("retail"),
+                    "r2": float(B.get("r_squared") or 0.0),
+                    "alpha": float(B.get("best_alpha") or 0.0),
+                    "n_obs": int(B.get("n_obs") or 0),
+                    "coefs": pick_coefs(B),
+                },
+            }
+
+            cta_lasso = _gen_cta("lasso_compare", facts_compare)
+
+            def gen_lasso_compare():
+                yield "data: Filtros → país: MX | categoría: - | tienda: -\n\n"
+
+                prompt = _prompt_lasso_compare_humano(facts_compare, hint_cta=None, include_cta=False)
+                for chunk in _stream_no_fin(prompt):
+                    yield chunk
+                yield "data: \n\n"
+
+                descA = A.get("nombre") or A.get("producto") or A.get("marca") or "-"
+                descB = B.get("nombre") or B.get("producto") or B.get("marca") or "-"
+                yield f"data: Descripción producto A: {descA} · Retail: {A.get('retail') or '-'}\n\n"
+                yield f"data: Descripción producto B: {descB} · Retail: {B.get('retail') or '-'}\n\n"
+
+                yield f"data: {cta_lasso}\n\n"
+                yield "data: [FIN]\n\n"
+
+            # memoriza sesión y responde
+            try:
+                remember_session(req.session_id,
+                                 filters={"country": "MX"},
+                                 intent="lasso_compare",
+                                 query=text,
+                                 hits=len(rows_a)+len(rows_b),
+                                 mentioned={"country": True})
+            except Exception:
+                pass
+
+            return StreamingResponse(gen_lasso_compare(), media_type="text/event-stream")
 
         # 1) Consulta a Milvus
         rows = query_lasso_models(lasso_plan["by"], lasso_plan["term"], topk=5)
@@ -1997,6 +1956,165 @@ def chat_stream(req: ChatReqStream):
 
 
 
+
+
+
+
+
+        # --- N consultas en un mismo string (separadas por ',' 'y' 'también') ---
+    subs = _extract_subqueries(text)
+    if len(subs) >= 2:
+
+        def gen_multi():
+            for i, q in enumerate(subs, 1):
+                # ======================
+                #   1) MACRO
+                # ======================
+                if q["type"] == "macro":
+                    var = q.get("var")
+                    cs  = q.get("countries") or []
+
+                    # -- Comparación multi-país
+                    if var and len(cs) >= 2:
+                        rows = macro_compare(var, cs) or []
+                        
+                        yield f"data: [MACRO] variable: {var} | países: {' | '.join(cs)}\n\n"
+                        for j, r in enumerate((rows or [])[:5], 1):
+                            yield f"data: {j}. {r.get('country')}: {r.get('value')} {r.get('unit') or ''} ({r.get('date') or ''})\n\n"
+                        # Redacción humana (macro_compare)
+                        facts = {
+                            "type": "macro_compare",
+                            "variable": var,
+                            "countries": cs,
+                            "rows": [
+                                {"country": x.get("country"), "name": x.get("name"),
+                                 "value": x.get("value"), "unit": x.get("unit"),
+                                 "date": x.get("date")}
+                                for x in (rows or [])
+                            ]
+                        }
+                        sub_text = f"compara {var} entre {', '.join(cs)} — resume en 2–3 líneas."
+                        prompt = _prompt_macro_humano("macro_compare", facts, "¿Agregar otro país o variable?")
+                        for chunk in _stream_no_fin(prompt):
+                            yield chunk
+                        yield "data: \n\n"
+
+                        # Mini tabla factual (máx 5)
+                        for j, r in enumerate(rows[:5], 1):
+                            yield f"data: {j}. {r.get('country')}: {r.get('value')} {r.get('unit') or ''} ({r.get('date') or ''})\n\n"
+                        yield "data: \n\n"
+                        continue
+
+                    # -- Lookup 1 país
+                    if var and len(cs) == 1:
+                        r = macro_lookup(var, cs[0])
+                        if r:
+                            yield f"data: [MACRO] País: {cs[0]} | variable: {var}\n\n"
+                            yield f"data: {_fmt_macro_row(r)}\n\n"
+                            facts = {
+                                "type": "macro_lookup",
+                                "variable": var,
+                                "country": cs[0],
+                                "row": {"country": r.get("country"), "name": r.get("name"),
+                                        "value": r.get("value"), "unit": r.get("unit"),
+                                        "date": r.get("date")}
+                            }
+                            prompt = _prompt_macro_humano("macro_lookup", facts, "¿Ver serie temporal o comparar con otro país?")
+                            for chunk in _stream_no_fin(prompt):
+                                yield chunk
+                            yield "data: \n\n"
+                            
+                        else:
+                            yield f"data: No hallé datos macro para {var} en {cs[0]}.\n\n"
+                        yield "data: \n\n"
+                        continue
+
+                    yield "data: Para variables macro necesito el país (ej.: 'IPC en CO').\n\n"
+                    yield "data: \n\n"
+                    continue
+
+                # ======================
+                #   2) PRODUCTOS (lookup)
+                # ======================
+                if q["type"] == "product":
+                    from collections import Counter
+
+                    f = {k: v for k, v in (q.get('filters') or {}).items() if v}
+                    rows = list_by_filter(f, limit=min(getattr(S, 'chat_list_default', 500), 40)) or []
+
+                    yield f"data: [PRODUCTOS] Filtros → {f}\n\n"
+
+                    # --- Construir FACTS y CTX primero ---
+                    hits = rows[:min(20, len(rows))]
+                    ctx = _build_ctx(hits, 10)
+
+                    base_filters = dict(f)
+                    base_filters.pop("store", None)
+
+                    rows_all = list_by_filter(base_filters, limit=min(getattr(S, "aggregate_limit", 5000), 5000)) or []
+                    prices = [r.get("price") for r in rows_all if r.get("price") is not None]
+
+                    cur = Counter([r.get("currency") for r in rows_all if r.get("currency")]).most_common(1)[0][0] if rows_all else None
+                    avg_all = (sum(prices) / max(len(prices), 1)) if prices else None
+
+                    agg_brand = aggregate_prices(base_filters, by="brand") or {}
+                    groups = [g for g in (agg_brand.get("groups") or [])
+                            if g and g.get("group") not in (None, "", "N/A") and g.get("avg") is not None]
+
+                    # Fallback de grupos a partir de hits
+                    if not groups and hits:
+                        tmp_sum, tmp_n = {}, {}
+                        for h in hits:
+                            b, p = (h.get("brand") or "N/A"), h.get("price")
+                            if p is None:
+                                continue
+                            tmp_sum[b] = tmp_sum.get(b, 0.0) + float(p)
+                            tmp_n[b] = tmp_n.get(b, 0) + 1
+                        groups = [{"group": b, "avg": tmp_sum[b] / max(tmp_n[b], 1), "count": tmp_n[b]} for b in tmp_sum]
+
+                    brands = sorted(
+                        [{"brand": g["group"], "avg": g["avg"], "count": g.get("count") or g.get("n") or 0} for g in groups],
+                        key=lambda x: -x["count"]
+                    )[:10]
+
+                    brand_range = None
+                    if brands:
+                        lo = min(brands, key=lambda b: b["avg"])
+                        hi = max(brands, key=lambda b: b["avg"])
+                        brand_range = {"min_brand": lo["brand"], "min_avg": lo["avg"],
+                                    "max_brand": hi["brand"], "max_avg": hi["avg"]}
+
+                    facts = {
+                        "country": f.get("country"),
+                        "category": f.get("category"),
+                        "currency": cur,
+                        "national_avg": float(avg_all) if avg_all is not None else None,
+                        "n": len(prices),
+                        "brands": brands,
+                        "brand_range": brand_range,
+                    }
+
+                    # --- Redacción humana AHORA sí (con facts y ctx listos) ---
+                    sub_text = f"precio de {f.get('category')} en {f.get('country')} — resume en 3–5 líneas, tono claro, sin muletillas."
+                    for chunk in _stream_no_fin(_prompt_lookup_from_facts(sub_text, facts, ctx)):
+                        yield chunk
+                    yield "data: \n\n"
+
+                    # Gráfica (si aplica)
+                    vizp = _maybe_viz_prompt("lookup", f, rows=rows)
+                    if vizp:
+                        yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+
+                    # Lista compacta
+                    for j, r in enumerate(rows[:10], 1):
+                        yield f"data: {_fmt_row(r, j)}\n\n"
+                    yield "data: \n\n"
+
+
+
+    # --- LASSO: influencia/descomposición solo para México ---
+    # --- LASSO: influencia/descomposición solo para México ---
+    
 
 
 
