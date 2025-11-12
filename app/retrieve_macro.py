@@ -267,3 +267,49 @@ def macro_compare(macro_canon: str, countries: List[str]) -> List[Dict[str, Any]
     # salida ordenada por país
     out.sort(key=lambda x: x.get("country") or "")
     return out
+
+# Coloca esto al inicio del archivo o cerca de utilidades:
+DEFAULT_COUNTRIES = ['AR','CO','MX','PA','BR','CR','PY','PE','CL','UY']
+
+def _macro_default_countries() -> list[str]:
+    """
+    Devuelve la lista de países para las comparaciones macro sin requerir settings.
+    - Si existe settings.S.countries la usa (sin romper si no está).
+    - Si existe la variable de entorno SPI_COUNTRIES="AR,CO,MX", la usa.
+    - Si no, usa un set por defecto pensado para LATAM.
+    """
+    # 1) settings.S (opcional; no falla si no está)
+    try:
+        from settings import S  # opcional
+        cs = getattr(S, "countries", None)
+        if cs:
+            return [str(c).upper() for c in cs if isinstance(c, str) and c.strip()]
+    except Exception:
+        pass
+
+    # 2) Variable de entorno (opcional)
+    import os
+    env = os.getenv("SPI_COUNTRIES")
+    if env:
+        cs = [c.strip().upper() for c in env.split(",") if c.strip()]
+        if cs:
+            return cs
+
+    # 3) Fallback seguro
+    return list(DEFAULT_COUNTRIES)
+
+
+def _macro_rank(var: str, countries: list[str]) -> list[dict]:
+    out = []
+    for c in countries:
+        r = macro_lookup(var, c)
+        if r and (r.get("value") is not None):
+            out.append({
+                "country": c,
+                "value": float(r["value"]),
+                "unit": r.get("unit"),
+                "date": r.get("date"),
+                "name": r.get("name"),
+            })
+    return out
+

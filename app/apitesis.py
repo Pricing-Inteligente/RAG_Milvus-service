@@ -22,7 +22,7 @@ S = get_settings()
 # Milvus helpers
 from retrieve import retrieve, list_by_filter, aggregate_prices
 
-# Inteligencia de intención / categoría
+# Inteligencia de intención / categoría 
 from intent_llm import parse_intent
 from category_resolver import resolve_category_semantic
 
@@ -75,7 +75,7 @@ MACRO_ALIASES = {
         "inflacion", "inflación"
     ],
     "interest_rate": [
-        "interest rate", "interest trate",
+        "interest rate", "interest trate",  
         "tasa de interes", "tasa de interés",
         "tipo de interes", "tipo de interés"
     ],
@@ -130,7 +130,7 @@ def _canonicalize_macro_var(name: str) -> str:
 
 
 
-# MACRO: detectar consultas tipo "¿qué país tiene X más alto/mas bajo?"
+# MACRO: detectar consultas tipo "¿qué país tiene X más alto/mas bajo?" 
 _SUPER_MAX_PAT = re.compile(r"\b(más\s+alto|mas\s+alto|mayor|top|máximo|maximo|más\s+caro|mas\s+caro)\b", re.I)
 _SUPER_MIN_PAT = re.compile(r"\b(más\s+bajo|mas\s+bajo|menor|mínimo|minimo|más\s+barato|mas\s+barato)\b", re.I)
 
@@ -239,7 +239,7 @@ CAT_ALIASES = {
         "leche uht", "leche entera", "leche descremada", "leche semidescremada"
     ],
 
-    # leche
+    # leche 
     "leche": ["leche en polvo", "leche polvo"],
 
     # pasta seca
@@ -305,7 +305,7 @@ CAT_ALIASES = {
     # banano
     "banano": ["banano", "bananos", "banana", "bananas"],
 
-    # pan
+    # pan 
     "pan": ["pan", "pan frances", "pan francés", "bollos"],
 }
 
@@ -376,17 +376,6 @@ def sanitize_filters(f: Dict | None) -> Dict:
             out[k] = f[k]
     return out
 
-def _sanitize_resp_excerpt(text: str, max_len: int = 600) -> str:
-    if not text:
-        return ""
-    s = re.sub(r"\s+", " ", text).strip()
-    if len(s) > max_len:
-        s = s[:max_len].rstrip() + "..."
-    # Escapar comillas dobles internas
-    s = s.replace('"', '\\"')
-    return s
-
-# -----------------------------------------------------------------------------
 # Fusión inteligente de filtros (Heurística + LLM + Semántico)
 
 def build_filters_smart(message: str, base: Optional[Dict] = None) -> Dict:
@@ -417,7 +406,7 @@ def build_filters_smart(message: str, base: Optional[Dict] = None) -> Dict:
     if llm.get("brand"):    filters.setdefault("brand", llm["brand"])
     if llm.get("category"):
         c_llm = _norm(llm["category"])
-
+        
         if c_llm not in { _norm(x) for x in GENERIC_CATS }:
             canon = NCATEGORIES.get(c_llm)
             if canon:
@@ -490,20 +479,20 @@ def merge_with_memory(
     last = MEM.get(sid) or {}
     lastf = last.get("last_filters", {}) or {}
 
-    merged = dict(filters)
+    merged = dict(filters)  
 
     # country
     if not merged.get("country") and lastf.get("country"):
         merged["country"] = lastf["country"]
 
-    # category
+    # category 
     if not merged.get("category") and lastf.get("category"):
         merged["category"] = lastf["category"]
     if prefer_last_cat and not m_cat and lastf.get("category"):
         # Fuerza la categoría anterior cuando no se mencionó explícitamente una nueva
         merged["category"] = lastf["category"]
 
-    #  store (política de persistencia condicionada)
+    #  store (política de persistencia condicionada) 
     if m_sto:
         # Si mencionaron tienda, respetamos lo que ya venga en merged
         pass
@@ -549,114 +538,113 @@ def _viz_title(filters: Dict, intent: str, group_by: str | None = None) -> str:
         return f"Precio de {cat}{loc} ({sto})"
     return f"Precio de {cat}{loc}"
 
-def _viz_prompt_from_rows(
-    rows: List[Dict],
-    filters: Dict,
-    *,
-    title: str | None = None,
-    max_n: int = 8,
-    label_priority: List[str] = ["brand", "name"],
-    user_prompt: str | None = None,
-    rag_response: str | None = None,
-) -> str:
+def _viz_prompt_from_rows(rows: List[Dict], filters: Dict, *, title: str | None = None,
+                          max_n: int = 8, label_priority: List[str] = ["brand","name"]) -> str:
     """
-    Construye prompt de visualización basado en la RESPUESTA RAG (no en el prompt del usuario).
-    Formato:
-    creame la mejor forma de visualizar este reporte analítico, usando el tipo de grafica que consideres apropiado: "RESPUESTA RAG PETICION".
+    Construye un prompt NL + dataset JSON para una barra simple (label vs price).
+    El front/servicio de charts puede entender 'label' como eje X y 'value' como eje Y.
     """
     if not rows:
         return ""
-    base = rag_response or user_prompt or title or _viz_title(filters, "lookup") or ""
-    excerpt = _sanitize_resp_excerpt(base)
-    return f'creame la mejor forma de visualizar este reporte analítico, usando el tipo de grafica que consideres apropiado: "{excerpt}".'
+    data = []
+    for r in rows[:max_n]:
+        label = None
+        for k in label_priority:
+            v = (r.get(k) or "").strip()
+            if v: label = v; break
+        if not label:
+            label = (r.get("name") or r.get("brand") or r.get("store") or r.get("product_id"))
+        if r.get("price") is None:
+            continue
+        data.append({
+            "label": label,
+            "value": float(r["price"]),
+            "currency": r.get("currency"),
+            "store": r.get("store"),
+            "brand": r.get("brand"),
+            "country": r.get("country"),
+            "product_id": r.get("product_id"),
+        })
+    if not data:
+        return ""
+    title = title or _viz_title(filters, "lookup")
+    nl = (
+        f"Genera una gráfica de barras titulada '{title}'. "
+        "Eje X: 'label'. Eje Y: 'value' (precio). "
+        "Usa el campo 'currency' solo para rotular si aplica. "
+        "Muestra etiquetas con 'brand' y 'store' cuando existan. "
+        f"Datos (JSON): {json.dumps(data, ensure_ascii=False)}"
+    )
+    return nl
 
-def _viz_prompt_from_agg(agg: Dict, filters: Dict, *, group_by: str, user_prompt: str | None = None,rag_response: str | None = None,) -> str:
+def _viz_prompt_from_agg(agg: Dict, filters: Dict, *, group_by: str) -> str:
     """
     Para agregados: usa el promedio como valor principal y pasa min/max para tooltips.
     Schema: [{label, value, min, max}]
     """
-    # groups = (agg or {}).get("groups") or []
-    # if not groups:
-    #     return ""
-    # labels = [str(g.get("group")) for g in groups if g.get("group") is not None]
-    # if not labels:
-    #     return ""
-    # title = _viz_title(filters, "aggregate", group_by=group_by)
-    # up = (user_prompt or title or "")
-    # upq = up.replace("'", "\\'")
-    # return f"creame la mejor visualizacion para responder la peticion '{upq}'."
-    if not (agg or {}).get("groups"):
+    groups = (agg or {}).get("groups") or []
+    if not groups:
         return ""
-    base = rag_response or user_prompt or _viz_title(filters, "aggregate", group_by=group_by) or ""
-    excerpt = _sanitize_resp_excerpt(base)
-    return f'creame la mejor forma de visualizar este reporte analítico, usando el tipo de grafica que consideres apropiado: "{excerpt}".'
+    data = [{
+        "label": str(g.get("group")),
+        "value": float(g.get("avg")) if g.get("avg") is not None else None,
+        "min": float(g.get("min")) if g.get("min") is not None else None,
+        "max": float(g.get("max")) if g.get("max") is not None else None,
+    } for g in groups if g.get("group") is not None]
+    data = [d for d in data if d["value"] is not None]
+    if not data:
+        return ""
+    title = _viz_title(filters, "aggregate", group_by=group_by)
+    nl = (
+        f"Genera una gráfica de barras titulada '{title}'. "
+        f"Eje X: '{group_by}'. Eje Y: 'value' (precio promedio). "
+        "Incluye bandas o tooltips con 'min' y 'max' si el sistema lo soporta. "
+        f"Datos (JSON): {json.dumps(data, ensure_ascii=False)}"
+    )
+    return nl
 
-def _viz_prompt_from_generic(
-    intent: str,
-    filters: Dict,
-    *,
-    user_prompt: str | None = None,
-    rag_response: str | None = None,
-) -> str:
-    base = rag_response or user_prompt or _viz_title(filters, intent) or ""
-    excerpt = _sanitize_resp_excerpt(base)
-    return f'creame la mejor forma de visualizar este reporte analítico, usando el tipo de grafica que consideres apropiado: "{excerpt}".'
-
-# def _maybe_viz_prompt(
-#     intent: str,
-#     filters: Dict,
-#     *,
-#     rows: List[Dict] | None = None,
-#     agg: Dict | None = None,
-#     group_by: str | None = None,
-#     series: List[Dict] | None = None,
-#     user_prompt: str | None = None,
-# ) -> str | None:
-#     try:
-#         if intent in ("lookup", "list", "compare") and rows:
-#             return _viz_prompt_from_rows(rows, filters, user_prompt=user_prompt)
-#         if intent == "aggregate" and agg and (agg.get("groups") or []):
-#             gb = group_by or "category"
-#             return _viz_prompt_from_agg(agg, filters, group_by=gb, user_prompt=user_prompt)
-
-#                 # TOPN: construir barras con los top N (usa "rows")
-#         if intent == "topn" and rows:
-#             up = (user_prompt or _viz_title(filters, "lookup") or "").strip()
-#             upq = up.replace("'", "\\'")
-#             return f"creame la mejor visualizacion para responder la peticion '{upq}'."
-
-#         # TREND: línea temporal con serie (usa "series")
-#         if intent == "trend" and series:
-#             up = (user_prompt or "tendencia de precios")
-#             upq = up.replace("'", "\\'")
-#             return f"creame la mejor visualizacion para responder la peticion '{upq}'."
-
-
-#     except Exception:
-#         return None
-#     return None
-
-def _maybe_viz_prompt(
-    intent: str,
-    filters: Dict,
-    *,
-    rows: List[Dict] | None = None,
-    agg: Dict | None = None,
-    group_by: str | None = None,
-    series: List[Dict] | None = None,
-    user_prompt: str | None = None,
-    rag_response: str | None = None,
-) -> str | None:
+def _maybe_viz_prompt(intent: str, filters: Dict, *, rows: List[Dict] | None = None,
+                      agg: Dict | None = None, group_by: str | None = None, series: List[Dict] | None = None, ) -> str | None:
     try:
         if intent in ("lookup", "list", "compare") and rows:
-            return _viz_prompt_from_rows(rows, filters, user_prompt=user_prompt, rag_response=rag_response)
+            return _viz_prompt_from_rows(rows, filters)
         if intent == "aggregate" and agg and (agg.get("groups") or []):
             gb = group_by or "category"
-            return _viz_prompt_from_agg(agg, filters, group_by=gb, user_prompt=user_prompt, rag_response=rag_response)
+            return _viz_prompt_from_agg(agg, filters, group_by=gb)
+        
+                # TOPN: construir barras con los top N (usa "rows")
         if intent == "topn" and rows:
-            return _viz_prompt_from_generic("topn", filters, user_prompt=user_prompt, rag_response=rag_response)
+            items = rows or []
+            data = [
+                {"label": (r.get("brand") or r.get("name") or "")[:18],
+                 "value": float(r.get("price") or 0.0)}
+                for r in items
+                if r.get("price") is not None
+            ]
+            return json.dumps({
+                "type": "bar",
+                "title": f"TOP {len(data)} por precio",
+                "x": "label",
+                "y": "value",
+                "data": data,
+                "unit": (items[0].get("currency") if items else None)
+            }, ensure_ascii=False)
+
+        # TREND: línea temporal con serie (usa "series")
         if intent == "trend" and series:
-            return _viz_prompt_from_generic("trend", filters, user_prompt=user_prompt, rag_response=rag_response)
+            points = [{"x": s.get("date"),
+                       "y": float(s.get("value") or 0.0)}
+                      for s in (series or []) if s.get("date")]
+            return json.dumps({
+                "type": "line",
+                "title": "Tendencia últimos días",
+                "x": "x",
+                "y": "y",
+                "data": points,
+                "unit": (series[-1].get("currency") if series else None)
+            }, ensure_ascii=False)
+
+
     except Exception:
         return None
     return None
@@ -682,13 +670,13 @@ def remember_session(session_id, *, filters, intent, query, hits):
     lastf = dict(last.get("last_filters") or {})
 
     # Solo pisa categoría si el turno la mencionó explícitamente o trae valor real
-    mentioned = last.get("last_mentioned") or {}
+    mentioned = last.get("last_mentioned") or {}  
     if "category" in filters and filters.get("category"):
         lastf["category"] = filters["category"]
     elif mentioned and mentioned.get("category"):
         lastf["category"] = filters.get("category")
 
-
+    
     if "country" in filters and filters.get("country"):
         lastf["country"] = filters["country"]
     if "store" in filters:
@@ -789,7 +777,7 @@ origins = [
     "http://localhost:5173",  # frontend local
     "http://127.0.0.1:5173",  # a veces Vite usa 127.0.0.1
     "http://localhost:8080",  # Lovable local
-    "http://localhost:8081",
+    "http://localhost:8081",      
     "http://127.0.0.1:8081",
 ]
 
@@ -876,7 +864,7 @@ def _stream_no_fin(prompt: str, *, model=None):
     Envuelve el stream del modelo y filtra un '[FIN]' que pudiera emitir.
     Nunca se llama a sí misma.
     """
-    m = model or llm_chat
+    m = model or llm_chat  
     for chunk in m.stream(prompt):
         # Asegura que trabajamos con str
         if isinstance(chunk, (bytes, bytearray)):
@@ -1260,7 +1248,7 @@ def _plan_from_llm(message: str) -> Optional[Plan]:
     except Exception:
         return None
 
-
+    
 
 # -----------------------------------------------------------------------------
 # /chat (planner + memoria + comparaciones inteligentes)
@@ -1282,8 +1270,8 @@ def _build_ctx(hits: List[Dict], k: int) -> str:
 def chat_stream(req: ChatReqStream):
     text = (req.message or "").strip()
     t_req0 = _now_ms()
-
-
+    
+    
 
         # (nuevo) Diagnóstico de "sin resultados"
     def _diagnose_no_results(intent: str, *, plan=None, text:str="", macros=None, rows=None, hits=None, agg=None) -> str:
@@ -1333,7 +1321,7 @@ def chat_stream(req: ChatReqStream):
         yield "data: [FIN]\n\n"
 
 
-
+    
 
     # Small-talk corto
     small = _is_smalltalk(text)
@@ -1343,10 +1331,10 @@ def chat_stream(req: ChatReqStream):
             "sid": req.session_id, "message": text, "intent": small
         })
         return StreamingResponse(llm_chat.stream(prompt), media_type="text/event-stream")
-
+    
 
     # --- REFINAR / SET FILTROS (antes de MACRO y planner) ---
-
+    
     if _is_refine_command(text):
         f_now = _guess_filters(text)
         if not any(f_now.values()):
@@ -1376,7 +1364,7 @@ def chat_stream(req: ChatReqStream):
     force_trend = _is_trend_query(nt)
 
 
-
+    
         # ------ RUTA MACRO (stream) ------
     macros = _extract_macros(text)
     if macros:
@@ -1428,63 +1416,6 @@ def chat_stream(req: ChatReqStream):
                 yield "data: [FIN]\n\n"
 
             return StreamingResponse(gen_super(), media_type="text/event-stream")
-
-
-
-
-
-
-                    # --- Superlativos macro: “¿qué país tiene X más alto/bajo?”
-        superl = _is_macro_superlative_query(text)
-        if superl and macros and "__ALL__" not in macros:
-            var = macros[0]  # ya viene canónico por MACRO_ALIASES
-
-            cs = getattr(S, "countries", None)
-            if not cs:
-                cs = sorted({v for v in COUNTRY_ALIASES.values() if isinstance(v, str) and len(v) == 2})
-
-            rows = macro_compare(var, cs) or []
-            if not rows:
-                reason = _diagnose_no_results("macro_compare", plan=None, text=text, macros=macros, rows=rows)
-                return StreamingResponse(_sse_no_data_ex(reason, {"country": cs}), media_type="text/event-stream")
-
-            key = lambda r: float(r.get("value") or 0.0)
-            best = (max(rows, key=key) if superl == "max" else min(rows, key=key))
-
-            def gen_super():
-                yield f"data: Filtros → variable: {var} | países: {' | '.join(cs)}\n\n"
-                facts = {
-                    "type": "macro_compare",
-                    "variable": var,
-                    "countries": cs,
-                    "rows": [
-                        {"country": x.get("country"), "name": x.get("name"),
-                        "value": x.get("value"), "unit": x.get("unit"), "date": x.get("date")}
-                        for x in rows
-                    ],
-                    "winner": {
-                        "mode": "máximo" if superl == "max" else "mínimo",
-                        "country": best.get("country"),
-                        "value": best.get("value"),
-                        "unit": best.get("unit"),
-                        "date": best.get("date"),
-                        "name": best.get("name"),
-                    },
-                }
-                prompt = _prompt_macro_humano(
-                    "macro_compare",
-                    facts,
-                    "¿Quieres que agregue otro país o ver la serie histórica?"
-                )
-                for chunk in _stream_no_fin(prompt):
-                    yield chunk
-                yield "data: [FIN]\n\n"
-
-            return StreamingResponse(gen_super(), media_type="text/event-stream")
-
-
-
-
 
 
         # ¿hay intención de productos en este mismo turno?
@@ -1577,7 +1508,7 @@ def chat_stream(req: ChatReqStream):
                 if not countries:
                     reason = _diagnose_no_results("macro_list", plan=None, text=text, macros=macros)
                     return StreamingResponse(_sse_no_data_ex(reason, {"country": countries or None}), media_type="text/event-stream")
-
+                
                 rows = macro_list(countries[0]) or []
                 if not rows:
                     reason = _diagnose_no_results("macro_list", plan=None, text=text, macros=macros, rows=rows)
@@ -1735,7 +1666,7 @@ def chat_stream(req: ChatReqStream):
         },
     )
 
-
+  
 
 
     # 5) Si no hubo plan, crear uno heurístico
@@ -1799,7 +1730,7 @@ def chat_stream(req: ChatReqStream):
         try:
             rows = list_by_filter(
                 plan.filters or None,limit = min(max(plan.limit or 100, 1), getattr(S, "chat_list_max", 1000)))
-
+            
             if not rows and plan.filters and plan.filters.get("category"):
                 f2 = dict(plan.filters); f2.pop("category", None)
                 rows = list_by_filter(f2, limit=min(max(plan.limit or 100, 1), getattr(S, "chat_list_max", 1000)))
@@ -1822,50 +1753,15 @@ def chat_stream(req: ChatReqStream):
 
         def gen():
             # --- VIZ_PROMPT ---
-            summary_txt = ""
-            # try:
-            #     vizp = _maybe_viz_prompt("list", plan.filters or {}, rows=rows, user_prompt=text)
-            # except NameError:
-            #     vizp = None
-            # if vizp:
-            #     yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+            try:
+                vizp = _maybe_viz_prompt("list", plan.filters or {}, rows=rows)
+            except NameError:
+                vizp = None
+            if vizp:
+                yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
-            # yield f"data: {_filters_head(plan.filters)}\n\n"
-            # # Mini-writer para saludo + contexto + 1-2 hallazgos + CTA
-            # try:
-            #     sample = [
-            #         {
-            #             "name": r.get("name"), "brand": r.get("brand"),
-            #             "price": r.get("price"), "currency": r.get("currency"),
-            #             "store": r.get("store")
-            #         } for r in rows[:5]
-            #     ]
-            #     prompt_summary = (
-            #         "Eres el asistente del SPI. Responde con: saludo breve → contexto "
-            #         "(país/categoría si están) → breve resumen de hallazgos (menciona 1–2 ejemplos) "
-            #         "→ CTA único (p.ej., \"¿Te muestro solo los más baratos por tienda?\").\n"
-            #         f"Contexto: filtros={json.dumps(plan.filters or {}, ensure_ascii=False)}\n"
-            #         f"Ejemplos(JSON): {json.dumps(sample, ensure_ascii=False)}"
-            #     )
-            #     summary_txt = llm_chat.generate(prompt_summary).strip()
-            #     if summary_txt:
-            #         yield f"data: {summary_txt}\n\n"
-            # except Exception:
-            #     pass
-
-            # yield f"data: Encontré {len(rows)} producto(s). Mostrando los primeros 10:\n\n"
-            # for i, r in enumerate(rows[:10], start=1):
-            #     line = (
-            #         f"{i}. {r.get('name')} · Marca: {r.get('brand')} · "
-            #         f"Pres: {r.get('size')}{r.get('unit')} · "
-            #         f"Precio: {r.get('price')} {r.get('currency')} · "
-            #         f"Tienda: {r.get('store')} · País: {r.get('country')} "
-            #         f"[{r.get('product_id')}]"
-            #     )
-            #     yield f"data: {line}\n\n"
-
-            # yield "data: Sugerencia: ¿quieres ver solo los más baratos por tienda o filtrar por marca?\n\n"
-            # yield "data: [FIN]\n\n"
+            yield f"data: {_filters_head(plan.filters)}\n\n"
+            # Mini-writer para saludo + contexto + 1-2 hallazgos + CTA
             try:
                 sample = [
                     {
@@ -1877,22 +1773,15 @@ def chat_stream(req: ChatReqStream):
                 prompt_summary = (
                     "Eres el asistente del SPI. Responde con: saludo breve → contexto "
                     "(país/categoría si están) → breve resumen de hallazgos (menciona 1–2 ejemplos) "
-                    "→ CTA único.\n"
+                    "→ CTA único (p.ej., \"¿Te muestro solo los más baratos por tienda?\").\n"
                     f"Contexto: filtros={json.dumps(plan.filters or {}, ensure_ascii=False)}\n"
                     f"Ejemplos(JSON): {json.dumps(sample, ensure_ascii=False)}"
                 )
                 summary_txt = llm_chat.generate(prompt_summary).strip()
+                if summary_txt:
+                    yield f"data: {summary_txt}\n\n"
             except Exception:
                 pass
-
-            yield f"data: {_filters_head(plan.filters)}\n\n"
-            if summary_txt:
-                yield f"data: {summary_txt}\n\n"
-
-            # VIZ_PROMPT basado en la respuesta generada (summary_txt)
-            vizp = _maybe_viz_prompt("list", plan.filters or {}, rows=rows, user_prompt=text, rag_response=summary_txt)
-            if vizp:
-                yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
             yield f"data: Encontré {len(rows)} producto(s). Mostrando los primeros 10:\n\n"
             for i, r in enumerate(rows[:10], start=1):
@@ -1904,12 +1793,13 @@ def chat_stream(req: ChatReqStream):
                     f"[{r.get('product_id')}]"
                 )
                 yield f"data: {line}\n\n"
-            yield "data: Sugerencia: ¿quieres ver solo los más baratos por tienda o filtrar por marca?\n\n"
+
+            yield "data: Sugerencia: ¿quieres ver solo los más baratos por tienda o filtrar por marca?\n\n"   
             yield "data: [FIN]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
-
+    
 
         # ---- TOPN → top N más baratos/caros ----
     if plan.intent == "topn":
@@ -1934,39 +1824,16 @@ def chat_stream(req: ChatReqStream):
 
         def gen_topn():
             # VIZ opcional (barras topN)
-            # try:
-            #     vizp = _maybe_viz_prompt("topn", plan.filters or {}, rows=top, user_prompt=text)
-            # except NameError:
-            #     vizp = None
-            # if vizp:
-            #     yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+            try:
+                vizp = _maybe_viz_prompt("topn", plan.filters or {}, rows=top)
+            except NameError:
+                vizp = None
+            if vizp:
+                yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
-            # yield f"data: {_filters_head(plan.filters)}\n\n"
+            yield f"data: {_filters_head(plan.filters)}\n\n"
 
-            # # Mini-writer humano (no stream ≠ evita doble FIN)
-            # try:
-            #     sample = [
-            #         {"name": r.get("name"), "brand": r.get("brand"), "price": r.get("price"),
-            #          "currency": r.get("currency"), "store": r.get("store")}
-            #         for r in top[:3]
-            #     ]
-            #     prompt_summary = (
-            #         "Eres el asistente del SPI. Formato: saludo breve → contexto (país/categoría/tienda si están) "
-            #         "→ resumen del TOP con 1–2 ejemplos → CTA único (p.ej., \"¿Filtramos por tienda o marca?\").\n"
-            #         f"Contexto: filtros={json.dumps(plan.filters or {}, ensure_ascii=False)}, n={n}, modo={mode}\n"
-            #         f"Ejemplos(JSON): {json.dumps(sample, ensure_ascii=False)}"
-            #     )
-            #     txt = llm_chat.generate(prompt_summary).strip()
-            #     if txt:
-            #         yield f"data: {txt}\n\n"
-            # except Exception:
-            #     pass
-
-            # yield f"data: TOP {n} {'más baratos' if mode=='cheap' else 'más caros'}:\n\n"
-            # for i, r in enumerate(top, 1):
-            #     yield f"data: {_fmt_row(r, i)}\n\n"
-            # yield "data: [FIN]\n\n"
-            summary_txt = ""
+            # Mini-writer humano (no stream ≠ evita doble FIN)
             try:
                 sample = [
                     {"name": r.get("name"), "brand": r.get("brand"), "price": r.get("price"),
@@ -1974,22 +1841,16 @@ def chat_stream(req: ChatReqStream):
                     for r in top[:3]
                 ]
                 prompt_summary = (
-                    "Eres el asistente del SPI. Formato: saludo breve → contexto "
-                    "→ resumen del TOP con 1–2 ejemplos → CTA único.\n"
+                    "Eres el asistente del SPI. Formato: saludo breve → contexto (país/categoría/tienda si están) "
+                    "→ resumen del TOP con 1–2 ejemplos → CTA único (p.ej., \"¿Filtramos por tienda o marca?\").\n"
                     f"Contexto: filtros={json.dumps(plan.filters or {}, ensure_ascii=False)}, n={n}, modo={mode}\n"
                     f"Ejemplos(JSON): {json.dumps(sample, ensure_ascii=False)}"
                 )
-                summary_txt = llm_chat.generate(prompt_summary).strip()
+                txt = llm_chat.generate(prompt_summary).strip()
+                if txt:
+                    yield f"data: {txt}\n\n"
             except Exception:
                 pass
-
-            yield f"data: {_filters_head(plan.filters)}\n\n"
-            if summary_txt:
-                yield f"data: {summary_txt}\n\n"
-
-            vizp = _maybe_viz_prompt("topn", plan.filters or {}, rows=top, user_prompt=text, rag_response=summary_txt)
-            if vizp:
-                yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
             yield f"data: TOP {n} {'más baratos' if mode=='cheap' else 'más caros'}:\n\n"
             for i, r in enumerate(top, 1):
@@ -2000,7 +1861,7 @@ def chat_stream(req: ChatReqStream):
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
-
+       
      # ---- TREND → tendencia últimos 30 días (o rango corto) ----
     if plan.intent == "trend":
         try:
@@ -2041,33 +1902,18 @@ def chat_stream(req: ChatReqStream):
 
         def gen_trend():
             # VIZ_PROMPT: línea temporal
-            # try:
-            #     vizp = _maybe_viz_prompt("trend", plan.filters or {}, series=ser, user_prompt=text)
-            # except NameError:
-            #     vizp = None
-            # if vizp:
-            #     yield f"data: [VIZ_PROMPT] {vizp}\n\n"
-
-            # yield f"data: {_filters_head(plan.filters)}\n\n"
-
-            # # Writer en stream (usa _stream_no_fin para evitar doble FIN)
-            # for chunk in _stream_no_fin(prompt):
-            #     yield chunk
-            # yield "data: [FIN]\n\n"
-            rag_buf = []
-            yield f"data: {_filters_head(plan.filters)}\n\n"
-            for chunk in _stream_no_fin(prompt):
-                try:
-                    content = chunk.split("data:",1)[1].strip()
-                except Exception:
-                    content = chunk
-                if content and content != "[FIN]":
-                    rag_buf.append(content)
-                yield chunk
-            full_resp = " ".join(rag_buf).strip()
-            vizp = _maybe_viz_prompt("trend", plan.filters or {}, series=ser, user_prompt=text, rag_response=full_resp)
+            try:
+                vizp = _maybe_viz_prompt("trend", plan.filters or {}, series=ser)
+            except NameError:
+                vizp = None
             if vizp:
                 yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+
+            yield f"data: {_filters_head(plan.filters)}\n\n"
+
+            # Writer en stream (usa _stream_no_fin para evitar doble FIN)
+            for chunk in _stream_no_fin(prompt):
+                yield chunk
             yield "data: [FIN]\n\n"
 
         return StreamingResponse(gen_trend(), media_type="text/event-stream",
@@ -2084,7 +1930,7 @@ def chat_stream(req: ChatReqStream):
             # --- NUEVO: inferir categoría si falta (sinónimos -> semántico) ---
             if not cat:
                 cat = _canonicalize_category(text)
-
+                
                 if cat:
                     plan.filters = dict(plan.filters or {}, category=cat)
 
@@ -2191,7 +2037,6 @@ def chat_stream(req: ChatReqStream):
                                 {"category": cat, "country": [d["country"] for d in facts["countries"]]},
                                 agg={"groups": groups},
                                 group_by="country",
-                                user_prompt=text,
                             )
                         except NameError:
                             vizp = None
@@ -2213,7 +2058,7 @@ def chat_stream(req: ChatReqStream):
                             "sid": req.session_id, "q": text[:120]
                         })
                         yield "data: [FIN]\n\n"
-
+                        
 
                     return StreamingResponse(
                         gen(), media_type="text/event-stream",
@@ -2239,7 +2084,6 @@ def chat_stream(req: ChatReqStream):
                             {"category": cat, "country": [c for c, _ in with_data]},
                             agg={"groups": groups},
                             group_by="country",
-                            user_prompt=text,
                         )
                     except NameError:
                         vizp = None
@@ -2284,7 +2128,7 @@ def chat_stream(req: ChatReqStream):
 
             def gen_single():
                 try:
-                    vizp = _maybe_viz_prompt("compare", plan.filters or {}, rows=hits[:2], user_prompt=text)
+                    vizp = _maybe_viz_prompt("compare", plan.filters or {}, rows=hits[:2])
                 except NameError:
                     vizp = None
                 if vizp:
@@ -2364,13 +2208,7 @@ def chat_stream(req: ChatReqStream):
         def gen():
             # VIZ_PROMPT (no cuenta para TTFB del LLM)
             try:
-                vizp = _maybe_viz_prompt(
-                    "aggregate",
-                    plan.filters or {},
-                    agg=agg,
-                    group_by=plan.group_by or "category",
-                    user_prompt=text,
-                )
+                vizp = _maybe_viz_prompt("aggregate", plan.filters or {}, agg=agg, group_by=plan.group_by or "category")
             except NameError:
                 vizp = None
             if vizp:
@@ -2531,58 +2369,42 @@ def chat_stream(req: ChatReqStream):
 
     def gen_lookup():
         # VIZ_PROMPT + encabezado (no cuentan para TTFB del LLM)
-        # try:
-        #     vizp = _maybe_viz_prompt("lookup", plan.filters or {}, rows=hits, user_prompt=text)
-        # except NameError:
-        #     vizp = None
-        # if vizp:
-        #     yield f"data: [VIZ_PROMPT] {vizp}\n\n"
-
-        # yield f"data: {_filters_head(plan.filters)}\n\n"
-
-        # # ---- LLM STREAM con TTFB y duración total ----
-
-        # t_llm0 = _now_ms()
-        # first_token_ms = None
-        # total_chars = 0
-        # for chunk in _stream_no_fin(prompt):
-        #     if first_token_ms is None:
-        #         first_token_ms = _now_ms()
-        #     total_chars += len(chunk)
-        #     yield chunk
-        # t_llm1 = _now_ms()
-
-        # _log_perf("chat_stream_lookup_perf", {
-        #     "gen_model": llm_chat.model,
-        #     "planner_ms": planner_ms,
-        #     "retrieve_ms": t_ret1 - t_ret0,
-        #     "ttfb_ms": (first_token_ms - t_llm0) if first_token_ms else None,
-        #     "llm_stream_ms": t_llm1 - t_llm0,
-        #     "total_ms": _now_ms() - t_req0,
-        #     "hits": len(hits),
-        #     "ctx_len_chars": len(ctx),
-        #     "top_k": plan.top_k or getattr(S, "top_k", 5),
-        #     "filters": plan.filters,
-        #     "q": text[:120],
-        #     "sid": req.session_id,
-        # })
-
-        # yield "data: [FIN]\n\n"
-        rag_buf = []
-        yield f"data: {_filters_head(plan.filters)}\n\n"
-        for chunk in _stream_no_fin(prompt):
-            # chunk ya viene con 'data: ...'; extraer contenido
-            try:
-                content = chunk.split("data:",1)[1].strip()
-            except Exception:
-                content = chunk
-            if content and content != "[FIN]":
-                rag_buf.append(content)
-            yield chunk
-        full_resp = " ".join(rag_buf).strip()
-        vizp = _maybe_viz_prompt("lookup", plan.filters or {}, rows=hits, user_prompt=text, rag_response=full_resp)
+        try:
+            vizp = _maybe_viz_prompt("lookup", plan.filters or {}, rows=hits)
+        except NameError:
+            vizp = None
         if vizp:
             yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+
+        yield f"data: {_filters_head(plan.filters)}\n\n"
+
+        # ---- LLM STREAM con TTFB y duración total ----
+        
+        t_llm0 = _now_ms()
+        first_token_ms = None
+        total_chars = 0
+        for chunk in _stream_no_fin(prompt):
+            if first_token_ms is None:
+                first_token_ms = _now_ms()
+            total_chars += len(chunk)
+            yield chunk
+        t_llm1 = _now_ms()
+
+        _log_perf("chat_stream_lookup_perf", {
+            "gen_model": llm_chat.model,
+            "planner_ms": planner_ms,
+            "retrieve_ms": t_ret1 - t_ret0,
+            "ttfb_ms": (first_token_ms - t_llm0) if first_token_ms else None,
+            "llm_stream_ms": t_llm1 - t_llm0,
+            "total_ms": _now_ms() - t_req0,
+            "hits": len(hits),
+            "ctx_len_chars": len(ctx),
+            "top_k": plan.top_k or getattr(S, "top_k", 5),
+            "filters": plan.filters,
+            "q": text[:120],
+            "sid": req.session_id,
+        })
+
         yield "data: [FIN]\n\n"
 
     return StreamingResponse(gen_lookup(), media_type="text/event-stream")
