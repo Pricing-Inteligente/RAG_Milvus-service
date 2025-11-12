@@ -1764,19 +1764,26 @@ def chat_stream(req: ChatReqStream):
         plan.intent = "trend"
 
     # >>> BLOQUE NUEVO: si es una consulta genérica de "precios de productos", listar por país
-    def _is_generic_prices(nt: str) -> bool:
-        return (("precio" in nt or "precios" in nt) and ("producto" in nt or "productos" in nt))
+    def _is_generic_prices(nt: str, *, has_category: bool) -> bool:
+        """
+        Considera 'genérico' solo si NO hay categoría detectada explícitamente
+        y el usuario habla de 'precios de productos' (en plural).
+        Evita dispararse con frases como 'precio del producto ... café'.
+        """
+        if has_category:
+            return False
+        return (("precio" in nt or "precios" in nt) and ("productos" in nt))
 
     nt2 = _norm(text)
-    if _is_generic_prices(nt2):
+    has_cat_hint = bool(heur_now.get("category") or (plan.filters or {}).get("category"))
+    if _is_generic_prices(nt2, has_category=has_cat_hint):
         plan.intent = "list"
-        # usa el limit que vino en el request si existe; si no, un default
         max_allowed = getattr(S, "chat_list_max", 1000)
         default_list = getattr(S, "chat_list_default", 500)
         plan.limit = min(max(req.limit or default_list, 1), max_allowed)
-        # limpiar filtros que no pidió explícitamente
+        # No elimines la categoría detectada; limpia solo ruido
         if plan.filters:
-            for k in ("category", "brand", "store"):
+            for k in ("brand", "store"):
                 plan.filters.pop(k, None)
     # <<< FIN BLOQUE NUEVO
 
