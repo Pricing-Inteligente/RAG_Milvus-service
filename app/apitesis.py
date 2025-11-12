@@ -89,19 +89,26 @@ NMACROS = { _norm(alias): canon
             for canon, aliases in MACRO_ALIASES.items()
             for alias in aliases }
 
+
+
 def _extract_macros(text: str) -> list[str]:
     nt = _norm(text or "")
     found: list[str] = []
+    # aliases directos (ipc, inflación, etc.)
     for alias, canon in NMACROS.items():
         if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", nt):
             if canon not in found:
                 found.append(canon)
-    # soporta también el caso "macro"/"variables macroeconómicas"
-    if ("variables macroeconomicas" in nt or "variables macroeconómicas" in nt
-        or re.search(r"(?<!\w)macro(?!\w)", nt)):
-        if "__ALL__" not in found:
-            found.append("__ALL__")
+    # variantes "macro…"
+    macro_any = (
+        re.search(r"(variables?|indicadores?)\s+macro(\s|-)?economicas?", nt) or
+        re.search(r"\bmacro(\s|-)?economicas?\b", nt) or
+        re.search(r"(?<!\w)macro(?!\w)", nt)
+    )
+    if macro_any and "__ALL__" not in found:
+        found.append("__ALL__")
     return found
+
 
 
 
@@ -182,20 +189,25 @@ def _canonicalize_category(cat_or_text: str | None) -> str | None:
 
 def _normalize_plan_filters(filters: dict | None, text_for_fallback: str) -> dict:
     f = dict(filters or {})
+
     # country → lista
     if "country" in f:
         clist = _coerce_country_list(f.get("country"))
-        if clist:
-            f["country"] = clist
-        else:
-            f.pop("country", None)
-    # category → canónica
+        if clist: f["country"] = clist
+        else:     f.pop("country", None)
+
+    # ⚠️ clave: si huele a macro, NO infieras categoría desde el texto
+    if _extract_macros(text_for_fallback) or _guess_macro(text_for_fallback):
+        if not f.get("category"):
+            f.pop("category", None)
+        return f
+
+    # category → canónica (con fallback semántico SOLO si no es macro)
     cat = f.get("category") or _canonicalize_category(text_for_fallback)
-    if cat:
-        f["category"] = cat
-    else:
-        f.pop("category", None)
+    if cat: f["category"] = cat
+    else:   f.pop("category", None)
     return f
+
 
 
 
@@ -629,6 +641,8 @@ def _maybe_viz_prompt(intent: str, filters: Dict, *, rows: List[Dict] | None = N
                 "data": data,
                 "unit": (items[0].get("currency") if items else None)
             }, ensure_ascii=False)
+        
+
 
         # TREND: línea temporal con serie (usa "series")
         if intent == "trend" and series:
@@ -665,19 +679,27 @@ def pick_effective_query(user_text: str, sid: Optional[str], prefer_last_cat: bo
         return last_q
     return user_text
 
-def remember_session(session_id, *, filters, intent, query, hits):
+# 1) Cambia la firma:
+def remember_session(
+    session_id: str,
+    *,
+    filters: dict,
+    intent: str,
+    query: str,
+    hits: int,
+    mentioned: dict | None = None,
+):
     last = MEM.get(session_id) or {}
     lastf = dict(last.get("last_filters") or {})
+    mnow = mentioned or {}
 
-    # Solo pisa categoría si el turno la mencionó explícitamente o trae valor real
-    mentioned = last.get("last_mentioned") or {}  
-    if "category" in filters and filters.get("category"):
+    # pisa categoría solo si llega valor o se mencionó en este turno
+    if filters.get("category"):
         lastf["category"] = filters["category"]
-    elif mentioned and mentioned.get("category"):
-        lastf["category"] = filters.get("category")
+    elif mnow.get("category"):
+        lastf["category"] = mnow["category"]
 
-    
-    if "country" in filters and filters.get("country"):
+    if "country" in filters and filters.get("country") is not None:
         lastf["country"] = filters["country"]
     if "store" in filters:
         lastf["store"] = filters.get("store")
@@ -687,8 +709,10 @@ def remember_session(session_id, *, filters, intent, query, hits):
         "last_filters": lastf,
         "last_intent": intent,
         "last_query": query,
-        "last_mentioned": mentioned
+        "last_mentioned": mnow,
+        "last_hits": int(hits or 0),
     })
+
 
 
 # Logging / Trazabilidad
@@ -861,23 +885,44 @@ class OllamaLLM:
 
 def _stream_no_fin(prompt: str, *, model=None):
     """
-    Envuelve el stream del modelo y filtra un '[FIN]' que pudiera emitir.
-    Nunca se llama a sí misma.
+    Envuelve el stream del modelo y filtra un '[FIN]' que pudiera emitir,
+    y también limpia encabezados/markdown/instrucciones no deseadas.
     """
-    m = model or llm_chat  
+    import re
+    m = model or llm_chat
+
+    # patrones de contenido que NO queremos enviar al cliente
+    BAD_LINE = re.compile(
+        r"^\s*(#{1,6}\s|[-*]\s|```)|"
+        r"(your\s*task|sql\s+query|construct an elaborate email subject|"
+        r"use actual data from|do not use hypothetical|BEGIN|END)",
+        re.I
+    )
+
     for chunk in m.stream(prompt):
-        # Asegura que trabajamos con str
+        # asegurar str
         if isinstance(chunk, (bytes, bytearray)):
             s = chunk.decode("utf-8", errors="ignore")
         else:
             s = str(chunk)
 
-        # Filtrar un posible FIN que venga del modelo
+        # filtrar un posible [FIN] que venga del modelo
         if s.strip() == "data: [FIN]":
             continue
 
-        # Ya viene con 'data: ...\n\n'
+        # limpiar líneas "problemáticas" (markdown/instruccionales)
+        try:
+            # el backend ya manda "data: ...\n\n"
+            payload = s.split("data:", 1)[1]
+        except Exception:
+            payload = s
+
+        # si TODA la línea luce mala, la saltamos
+        if BAD_LINE.search(payload):
+            continue
+
         yield s
+
 
 
 
@@ -954,22 +999,104 @@ def _prompt_lookup_from_facts(question: str, facts: dict, ctx: str) -> str:
         "Ahora redacta la respuesta completa."
     )
 
+def _cta_options(intent: str, facts: dict) -> list[str]:
+    """
+    Devuelve SOLO opciones compatibles con el sistema para cada intent.
+    No inventes opciones aquí: todo lo listado debe existir.
+    """
+    var = facts.get("variable") or (facts.get("variables") or [None])[0]
+    country = facts.get("country")
+    base_var = "esta variable" if var else "una variable"
+    loc = f" en {country}" if country else ""
 
-def _prompt_macro_humano(intent: str, facts: dict, hint_cta: str) -> str:
+    if intent in ("macro_list", "macro_lookup", "macro_compare", "macro_rank"):
+        return [
+            "¿Te muestro solo inflación, tasa o dólar?",
+            f"¿Quieres comparar {base_var} entre países?",
+            f"¿Ver la serie histórica de {base_var}{loc}?",
+            "¿Quieres ver el país con el valor más bajo o más alto?",
+        ]
+
+    if intent == "list":
+        return [
+            "¿Te muestro solo los más baratos por tienda?",
+            "¿Filtramos por marca o presentación?",
+        ]
+
+    if intent == "lookup":
+        return [
+            "¿Filtramos por tienda o marca?",
+            "¿Te muestro los más baratos por tienda?",
+        ]
+
+    if intent == "aggregate":
+        return [
+            "¿Genero una gráfica con estos resultados?",
+            "¿Cambio el agrupamiento por país o tienda?",
+        ]
+
+    if intent == "compare":
+        return [
+            "¿Agrego otro país a la comparación?",
+            "¿Quieres comparar otra categoría?",
+        ]
+
+    return ["¿Quieres que profundice?"]
+
+
+def _prompt_cta_from_facts(intent: str, facts: dict) -> str:
+    """
+    Pide al LLM que devuelva UNA sola pregunta elegida EXCLUSIVAMENTE
+    de la lista de opciones permitidas para el intent dado.
+    """
     import json
+    options = _cta_options(intent, facts)
+    opts_txt = "\n- ".join(options)
     return (
-        "Eres el asistente del Sistema de Pricing Inteligente (SPI). "
-        "Escribe en español, tono profesional y natural. "
-        "Responde en 3–6 frases de TEXTO PLANO: sin markdown, sin títulos, sin viñetas, "
-        "sin negritas (**), sin encabezados (#) y sin bloques de código. "
-        "NO muestres el JSON ni nombres de campos; úsalo solo como fuente. "
-        "Estructura: 1) saludo breve; 2) contexto (variable/país/es y fecha si aparece); "
-        "3) respuesta con las cifras del JSON; 4) cierre con un único call to action.\n"
+        "Eres el asistente del SPI. Devuelve UNA sola pregunta (CTA) en español, "
+        "sin emojis ni markdown, terminada en '?'. "
+        "Debes elegirla EXACTAMENTE de la lista de opciones permitidas; "
+        "no reformules, no combines ni inventes nuevas opciones. "
+        "Devuelve solo la pregunta.\n"
+        f"INTENT: {intent}\n"
         f"FACTS(JSON): {json.dumps(facts, ensure_ascii=False)}\n"
-        f"Evita términos o marcadores como 'end_of_one_example'. "
-        f"CTA sugerido: {hint_cta}\n"
-        "Responde solo el texto final, sin JSON ni formato markdown."
+        f"Opciones permitidas:\n- {opts_txt}\n"
+        "Pregunta:"
     )
+
+
+def _gen_cta(intent: str, facts: dict) -> str:
+    try:
+        cta = (llm_chat.generate(_prompt_cta_from_facts(intent, facts)) or "").strip()
+        # fallback muy breve si el modelo se queda en blanco
+        return cta if cta else "¿Quieres que profundice?"
+    except Exception:
+        return "¿Quieres que profundice?"
+
+
+
+
+
+
+
+
+def _prompt_macro_humano(intent: str, facts: dict, hint_cta: str, include_cta: bool = True) -> str:
+    import json
+    base = (
+        "Eres el asistente del SPI. Español, tono profesional y natural. "
+        "Escribe en 3–6 frases de TEXTO PLANO: sin markdown, sin títulos, sin viñetas ni bloques de código. "
+        "Prohibido subtítulos ('###'), 'Your task:', SQL o instrucciones meta. "
+        "NO muestres el JSON ni nombres de campos. "
+        "Estructura: 1) saludo breve; 2) contexto; 3) respuesta con cifras.\n"
+        f"FACTS(JSON): {json.dumps(facts, ensure_ascii=False)}\n"
+    )
+    if include_cta:
+        base += f"Termina con un único CTA: {hint_cta}\n"
+    else:
+        base += "No incluyas CTA todavía; termina después de la explicación.\n"
+    return base + "Responde solo el texto final, sin JSON ni markdown."
+
+
 
 
 
@@ -1029,11 +1156,13 @@ _REFINE_PAT = re.compile(
 
 def _is_just_filters_command(text: str) -> bool:
     t = _norm(text or "")
-    # Si pide datos explícitos, no es refine “silencioso”
-    if re.search(r"(precio|precios|promedio|media|tendencia|historia|serie|lista|listar|compara|comparar|top|gráfic|grafica)", t):
+    # si pide datos explícitos, no es refine “silencioso”
+    if re.search(r"(precio|precios|promedio|media|tendencia|historia|serie|lista|listar|"
+                 r"muestrame|muestra|mostrame|mostrar|ensename|ensename|compara|comparar|top|grafic)", t):
         return False
     heur = _guess_filters(text)
     return any(heur.values())
+
 
 def _is_refine_command(text: str) -> bool:
     return bool(_REFINE_PAT.search(_norm(text or "")) or _is_just_filters_command(text))
@@ -1152,6 +1281,17 @@ def _guess_filters(text: str) -> Dict:
         if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", nt):
             f["store"] = canon; break
     return f
+
+def _detect_mentions_from_text(text: str) -> dict:
+    t = text.lower()
+    return {
+        "category": ("categoria" in t) or ("categoría" in t) or (" de " in t and "precio" in t),
+        "country": (" en " in t) or ("país" in t) or ("pais" in t),
+        "store": ("tienda" in t) or ("retailer" in t),
+    }
+
+
+
 
 
 # --- EXTRA: detectar N países mencionados (hasta 10) en orden de mención ---
@@ -1274,11 +1414,12 @@ def chat_stream(req: ChatReqStream):
     
 
         # (nuevo) Diagnóstico de "sin resultados"
-    def _diagnose_no_results(intent: str, *, plan=None, text:str="", macros=None, rows=None, hits=None, agg=None) -> str:
-        f = (plan.filters if plan else {}) or {}
+    def _diagnose_no_results(intent: str, *, plan=None, text:str="", macros=None, rows=None, hits=None, agg=None, filters: dict | None = None) -> str:
+        f = (filters or (plan.filters if plan else {}) or {})
         countries = f.get("country")
         category  = f.get("category")
         store     = f.get("store")
+
 
         # --- MACRO ---
         if intent in ("macro_list","macro_compare","macro_lookup"):
@@ -1335,7 +1476,7 @@ def chat_stream(req: ChatReqStream):
 
     # --- REFINAR / SET FILTROS (antes de MACRO y planner) ---
     
-    if _is_refine_command(text):
+    if _is_refine_command(text) and not (_extract_macros(text) or _guess_macro(text)):
         f_now = _guess_filters(text)
         if not any(f_now.values()):
             reason = "no identifiqué qué filtro cambiar (país/categoría/tienda). ¿Cuál ajusto?"
@@ -1344,11 +1485,19 @@ def chat_stream(req: ChatReqStream):
         # fusiona con lo último que tengamos
         last = MEM.get(req.session_id) or {}
         lastf = (last.get("last_filters") or {})
-        new_filters = sanitize_filters({**lastf, **f_now})
+        new_filters = _normalize_plan_filters({**lastf, **f_now}, text)
+
 
         # guarda la memoria
         if req.session_id:
-            MEM.set(req.session_id, {"last_filters": new_filters})
+            remember_session(
+                req.session_id,
+                filters=new_filters,
+                intent="refine",
+                query=text,
+                hits=0,
+                mentioned=_detect_mentions_from_text(text),
+            )
 
         # responde breve y CIERRA con [FIN]
         def gen_refine():
@@ -1357,11 +1506,6 @@ def chat_stream(req: ChatReqStream):
             yield "data: [FIN]\n\n"
         return StreamingResponse(gen_refine(), media_type="text/event-stream")
 
-
-    # --- Señaladores rápidos de intent (topN, trend) antes del planner ---
-    nt = _norm(text)
-    force_topn = _is_topn_query(nt)
-    force_trend = _is_trend_query(nt)
 
 
     
@@ -1413,6 +1557,9 @@ def chat_stream(req: ChatReqStream):
                 for i, r in enumerate(ranked[:topn], start=1):
                     yield f"data: {i}. {r['country']}: {r['value']} {r.get('unit') or ''} ({r.get('date') or ''})\n\n"
 
+
+                facts_for_cta = {"filters": plan.filters or {}, "n": len(top), "mode": mode}
+                yield f"data: {_gen_cta('topn', facts_for_cta)}\n\n"
                 yield "data: [FIN]\n\n"
 
             return StreamingResponse(gen_super(), media_type="text/event-stream")
@@ -1424,6 +1571,16 @@ def chat_stream(req: ChatReqStream):
 
         # Si hay macros + productos => MIXED
         if has_products and countries:
+            # <-- construir 'mentioned' temprano (aquí sí existe)
+            mentioned_early = {
+                "category": "category" in heur_now,
+                "country":  "country"  in heur_now,
+                "store":    "store"    in heur_now,
+            }
+            # filtros de productos para este turno
+            pf = {k: v for k, v in (heur_now or {}).items()
+                if k in ("country", "category", "store") and v}
+
             def gen_mix():
                 # --- Sección MACRO ---
                 for m in macros:
@@ -1431,7 +1588,6 @@ def chat_stream(req: ChatReqStream):
                         rows = macro_list(countries[0]) or []
                         if rows:
                             yield f"data: [MACRO] País: {countries[0]} | variables: TODAS (mostrando 10)\n\n"
-
                             facts = {
                                 "type": "macro_list",
                                 "country": countries[0],
@@ -1441,17 +1597,15 @@ def chat_stream(req: ChatReqStream):
                                     for x in (rows[:10] if rows else [])
                                 ]
                             }
-                            prompt = _prompt_macro_humano("macro_list", facts, "¿Quieres que me enfoque en inflación, tasa o dólar?")
+                            prompt = _prompt_macro_humano("macro_list", facts, " ", include_cta=False)
                             for chunk in _stream_no_fin(prompt):
                                 yield chunk
                             yield "data: \n\n"
-
 
                     elif len(countries) >= 2:
                         rows = macro_compare(m, countries) or []
                         if rows:
                             yield f"data: [MACRO] {m} | países: {' | '.join(countries)}\n\n"
-                            # --- MACRO WRITER (COMPARE) ---
                             facts = {
                                 "type": "macro_compare",
                                 "variable": m,
@@ -1462,16 +1616,15 @@ def chat_stream(req: ChatReqStream):
                                     for x in (rows or [])
                                 ]
                             }
-                            prompt = _prompt_macro_humano("macro_compare", facts, "¿Agrego otro país o convierto a misma base si aplica?")
+                            prompt = _prompt_macro_humano("macro_compare", facts, " ", include_cta=False)
                             for chunk in _stream_no_fin(prompt):
                                 yield chunk
                             yield "data: \n\n"
 
                     else:
-                        r = macro_lookup(m, countries[0]) if len(countries)==1 else None
+                        r = macro_lookup(m, countries[0]) if len(countries) == 1 else None
                         if r:
                             yield f"data: [MACRO] País: {countries[0]} | variable: {m}\n\n"
-                            # --- MACRO WRITER (LOOKUP) ---
                             facts = {
                                 "type": "macro_lookup",
                                 "variable": m,
@@ -1481,37 +1634,58 @@ def chat_stream(req: ChatReqStream):
                                 "date": (r or {}).get("date"),
                                 "name": (r or {}).get("name"),
                             }
-                            prompt = _prompt_macro_humano("macro_lookup", facts, "¿La comparamos con otro país o te muestro la serie?")
+                            prompt = _prompt_macro_humano("macro_lookup", facts, " ", include_cta=False)
                             for chunk in _stream_no_fin(prompt):
                                 yield chunk
                             yield "data: \n\n"
 
-
                 # --- Sección PRODUCTOS ---
-                pf = {k: v for k, v in (heur_now or {}).items() if k in ("country","category","store") and v}
-                # si no trajo categoría exacta, igual intenta listado general por país
-                rows_prod = list_by_filter(pf, limit= min(getattr(S, 'chat_list_default', 500), 40))
-                if not rows_prod and pf.get("category"):
-                    pf2 = dict(pf); pf2.pop("category", None)
-                    rows_prod = list_by_filter(pf2, limit= min(getattr(S, 'chat_list_default', 500), 40))
+                pf2 = dict(pf)
+                rows_prod = list_by_filter(pf2, limit=min(getattr(S, "chat_list_default", 500), 40))
+                if not rows_prod and pf2.get("category"):
+                    pf2.pop("category", None)
+                    rows_prod = list_by_filter(pf2, limit=min(getattr(S, "chat_list_default", 500), 40))
 
                 if rows_prod:
-                    yield f"data: [PRODUCTOS] Filtros → {pf}\n\n"
+                    yield f"data: [PRODUCTOS] Filtros → {pf2}\n\n"
                     for i, r in enumerate(rows_prod[:10], start=1):
                         yield f"data: {_fmt_row(r, i)}\n\n"
+
+                # CTA final acotado a opciones válidas (intent 'list' de productos)
+                facts_for_cta = {"filters": pf2, "n_listados": len(rows_prod or [])}
+                yield f"data: {_gen_cta('list', facts_for_cta)}\n\n"
                 yield "data: [FIN]\n\n"
-            return StreamingResponse(gen_mix(), media_type="text/event-stream")
+
+            # Persistimos memoria SIN usar 'plan' ni 'with_data'
+            try:
+                hits_mix = len(list_by_filter(pf, limit=min(getattr(S, "chat_list_default", 500), 40)) or [])
+            except Exception:
+                hits_mix = 0
+
+            remember_session(
+                req.session_id,
+                filters=pf if pf else {"country": countries},
+                intent="list",  # la parte de productos del MIX es un listado
+                query=text,
+                hits=hits_mix,
+                mentioned=mentioned_early,
+            )
+
+            return StreamingResponse(
+                gen_mix(), media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+            )
 
         # ---- Si NO hay productos en el mismo turno, conserva el comportamiento original ----
         try:
             if "__ALL__" in macros:
                 if not countries:
-                    reason = _diagnose_no_results("macro_list", plan=None, text=text, macros=macros)
+                    reason = _diagnose_no_results("macro_list", text=text, macros=macros, filters={"country": countries})
                     return StreamingResponse(_sse_no_data_ex(reason, {"country": countries or None}), media_type="text/event-stream")
                 
                 rows = macro_list(countries[0]) or []
                 if not rows:
-                    reason = _diagnose_no_results("macro_list", plan=None, text=text, macros=macros, rows=rows)
+                    reason = _diagnose_no_results("macro_list", text=text, macros=macros, rows=rows, filters={"country": countries})
                     return StreamingResponse(_sse_no_data_ex(reason, {"country": countries}), media_type="text/event-stream")
 
                 def gen_all():
@@ -1534,6 +1708,8 @@ def chat_stream(req: ChatReqStream):
                     yield f"data: Encontré {len(rows)} variable(s). Mostrando las primeras:\n\n"
                     for i, r in enumerate(rows[:10], start=1):
                         yield f"data: {_fmt_macro_row(r, i)}\n\n"
+
+                    yield f"data: {_gen_cta('macro_list', facts)}\n\n"
                     yield "data: [FIN]\n\n"
                 MEM.set(req.session_id, {"last_country": countries[0]})
                 return StreamingResponse(gen_all(), media_type="text/event-stream")
@@ -1543,7 +1719,7 @@ def chat_stream(req: ChatReqStream):
                 for m in macros:
                     rows.extend(macro_compare(m, countries) or [])
                 if not rows:
-                    reason = _diagnose_no_results("macro_compare", plan=None, text=text, macros=macros, rows=rows)
+                    reason = _diagnose_no_results("macro_compare", text=text, macros=macros, rows=rows, filters={"country": countries})
                     return StreamingResponse(_sse_no_data_ex(reason, {"country": countries}), media_type="text/event-stream")
 
                 def gen_cmp():
@@ -1566,6 +1742,8 @@ def chat_stream(req: ChatReqStream):
 
                     for i, r in enumerate(rows, start=1):
                         yield f"data: {_fmt_macro_row(r, i)}\n\n"
+
+                    yield f"data: {_gen_cta('macro_compare', facts)}\n\n"    
                     yield "data: [FIN]\n\n"
                 return StreamingResponse(gen_cmp(), media_type="text/event-stream")
 
@@ -1573,7 +1751,7 @@ def chat_stream(req: ChatReqStream):
                 # primera macro mencionada por simplicidad
                 r = macro_lookup(macros[0], countries[0])
                 if not r:
-                    reason = _diagnose_no_results("macro_lookup", plan=None, text=text, macros=macros, rows=[])
+                    reason = _diagnose_no_results("macro_lookup", text=text, macros=macros, rows=[], filters={"country": countries[0] if countries else None})
                     return StreamingResponse(_sse_no_data_ex(reason, {"country": countries[0]}), media_type="text/event-stream")
                 def gen_one():
                     yield f"data: Filtros → país: {countries[0]} | variable: {macros[0]}\n\n"
@@ -1593,6 +1771,8 @@ def chat_stream(req: ChatReqStream):
                     yield "data: \n\n"
 
                     yield f"data: {_fmt_macro_row(r)}\n\n"
+
+                    yield f"data: {_gen_cta('macro_lookup', facts)}\n\n"
                     yield "data: [FIN]\n\n"
                 return StreamingResponse(gen_one(), media_type="text/event-stream")
 
@@ -1723,6 +1903,10 @@ def chat_stream(req: ChatReqStream):
                               "store": "store" in heur_now},
     })
 
+    # <-- pega aquí
+    mentioned = dict(getattr(plan, "explicit_mentions", {}) or {}) or _detect_mentions_from_text(text)
+
+
     # === INTENTS ===
 
     # ---- LIST → stream de tabla simple ----
@@ -1740,7 +1924,7 @@ def chat_stream(req: ChatReqStream):
             return StreamingResponse(_sse_no_data_ex(reason, plan.filters), media_type="text/event-stream")
 
 
-        remember_session(req.session_id, filters=plan.filters, intent="list", query=text, hits=rows)
+        remember_session(req.session_id, filters=plan.filters, intent="list", query=text, hits=len(rows), mentioned=mentioned)
         _log_event("chat_stream_list", {
             "sid": req.session_id,
             "filters": plan.filters,
@@ -1916,6 +2100,16 @@ def chat_stream(req: ChatReqStream):
                 yield chunk
             yield "data: [FIN]\n\n"
 
+
+        remember_session(
+            req.session_id,
+            filters=plan.filters,
+            intent="trend",
+            query=text,
+            hits=len(ser),
+            mentioned=mentioned,
+                    )
+
         return StreamingResponse(gen_trend(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
@@ -1927,14 +2121,13 @@ def chat_stream(req: ChatReqStream):
             countries = _extract_countries(text, max_n=10)
             cat = (plan.filters or {}).get("category")
 
-            # --- NUEVO: inferir categoría si falta (sinónimos -> semántico) ---
+            # --- Inferir categoría si falta (sinónimos -> semántico) ---
             if not cat:
                 cat = _canonicalize_category(text)
-                
                 if cat:
                     plan.filters = dict(plan.filters or {}, category=cat)
 
-            # Si el usuario mencionó >=2 países y (ahora sí) hay categoría → multi-compare
+            # === MULTI-PAÍS + CATEGORÍA → comparación por país ===
             if len(countries) >= 2 and cat:
                 per_country_rows: list[tuple[str, list[dict]]] = []
                 top_per_country = max(min(plan.top_k or 3, 5), 1)  # 1..5 por país
@@ -1966,66 +2159,79 @@ def chat_stream(req: ChatReqStream):
                     try:
                         suggestions = {}
                         for code in without_data:
-                            # agregados por categoría en ese país (sin forzar "cafe")
+                            # agregados por categoría en ese país (sin forzar una categoría específica)
                             agg_cat = aggregate_prices({"country": code}, by="category") or {}
                             groups = agg_cat.get("groups") or []
-                            # prioriza categorías que contengan "cafe" (normalizado)
-                            def _n(s): return (s or "").lower()
                             candidates = [g.get("group") for g in groups if g and g.get("group")]
-                            cafe_like = [c for c in candidates if "cafe" in _n(c) or "caf" in _n(c) or "coffee" in _n(c)]
-                            suggestions[code] = cafe_like[:3] or candidates[:3]  # top 3
+                            suggestions[code] = candidates[:3]
                     except Exception:
                         suggestions = {}
 
-                    reason = f"necesito al menos 2 países con datos para '{cat}', pero tuve " \
-                            f"{len(with_data)} con datos y {len(without_data)} sin datos."
+                    reason = (
+                        f"necesito al menos 2 países con datos para '{cat}', "
+                        f"pero tuve {len(with_data)} con datos y {len(without_data)} sin datos."
+                    )
+
                     def gen_hint():
-                        yield f"data: Hola. No pude comparar porque {reason}\n\n"
-                        yield f"data: Filtros → países: {countries} | categoría: {cat}\n\n"
+                        yield f"data: Hola. No pude comparar porque {reason}\n\n"  # saludo + respuesta breve
+                        yield f"data: Filtros → países: {countries} | categoría: {cat}\n\n"  # contexto
                         for code in without_data:
                             opts = suggestions.get(code) or []
                             if opts:
                                 yield f"data: Sugerencia para {code}: prueba con categoría(s) {', '.join(opts)}\n\n"
                             else:
                                 yield f"data: Sugerencia para {code}: prueba sin categoría o con otra similar.\n\n"
+                        # CTA al final (acotado a opciones válidas de compare)
+                        facts_for_cta = {"category": cat, "countries": countries, "with_data": [c for c, _ in with_data]}
+                        yield f"data: {_gen_cta('compare', facts_for_cta)}\n\n"
                         yield "data: [FIN]\n\n"
+
                     return StreamingResponse(gen_hint(), media_type="text/event-stream")
 
+                # Persistimos sesión aquí (ya existe with_data)
+                total_hits = sum(len(rows) for _, rows in with_data)
+                remember_session(
+                    req.session_id,
+                    filters=dict(plan.filters or {}, country=countries),
+                    intent="compare",
+                    query=text,
+                    hits=total_hits,
+                    mentioned=mentioned,
+                )
 
-                # --- Si quieres redacción humana, usa LLM con "hechos" agregados
+                # --- Redacción humana con LLM (sin CTA en el prompt; CTA al final) ---
+                # preparar hechos por país
+                facts = {"category": cat, "countries": []}
+                from collections import Counter
+                for c, rows in with_data:
+                    prices = [r.get("price") for r in rows if r.get("price") is not None]
+                    if not prices:
+                        continue
+                    cur = Counter([r.get("currency") for r in rows if r.get("currency")]).most_common(1)[0][0] if rows else None
+                    brands = {r.get("brand") for r in rows if r.get("brand")}
+                    facts["countries"].append({
+                        "country": c,
+                        "avg": sum(prices) / max(len(prices), 1),
+                        "min": min(prices),
+                        "max": max(prices),
+                        "n": len(prices),
+                        "brands_n": len(brands),
+                        "currency": cur
+                    })
+
+                ctx_json = json.dumps(facts, ensure_ascii=False)
+                prompt = (
+                    f"Eres el asistente del Sistema Pricing Inteligente (SPI). "
+                    f"Redacta de forma natural y amable una comparativa de precios para la categoría '{cat}'. "
+                    f"Usa exclusivamente estos HECHOS (JSON): {ctx_json}. "
+                    "Formato de TEXTO PLANO, sin markdown ni listas. "
+                    "Estructura: 1) saludo breve; 2) contexto (países, categoría, moneda si aplica); "
+                    "3) respuesta comparativa (promedio, mínimo, máximo y conteo de marcas por país). "
+                    "No incluyas CTA ni instrucciones; solo el texto."
+                )
+
                 if getattr(S, "compare_llm", True):
-                    # preparar hechos por país
-                    facts = {"category": cat, "countries": []}
-                    for c, rows in with_data:
-                        prices = [r.get("price") for r in rows if r.get("price") is not None]
-                        if not prices:
-                            continue
-                        # moneda más común
-                        from collections import Counter
-                        cur = None
-                        if rows:
-                            cur = Counter([r.get("currency") for r in rows if r.get("currency")]).most_common(1)[0][0]
-                        brands = {r.get("brand") for r in rows if r.get("brand")}
-                        facts["countries"].append({
-                            "country": c,
-                            "avg": sum(prices) / max(len(prices), 1),
-                            "min": min(prices),
-                            "max": max(prices),
-                            "n": len(prices),
-                            "brands_n": len(brands),
-                            "currency": cur
-                        })
-
-                    ctx_json = json.dumps(facts, ensure_ascii=False)
-                    prompt = (
-                        f"Eres el asistente del Sistema Pricing Inteligente (SPI). "
-                        f"Redacta de forma natural y amable una comparativa de precios para la categoría '{cat}'. "
-                        f"Usa exclusivamente estos HECHOS (JSON): {ctx_json}. "
-                        "Estructura: saludo breve → contexto → respuesta comparativa (promedio, mínimo, máximo y conteo de marcas por país) → "
-                        "cierre con un mini resumen y un call to action para filtrar más."
-                    )
-
-                    def gen():
+                    def gen_llm():
                         # VIZ opcional
                         try:
                             groups = [
@@ -2044,9 +2250,9 @@ def chat_stream(req: ChatReqStream):
                             yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
                         head = " | ".join(countries)
-                        yield f"data: Filtros → categoría: {cat} | países: {head} | tienda: -\n\n"
+                        yield f"data: Filtros → categoría: {cat} | países: {head} | tienda: -\n\n"  # contexto
 
-                        # LLM stream
+                        # Writer humano (sin CTA)
                         t_llm0 = _now_ms(); first_token_ms = None
                         for chunk in _stream_no_fin(prompt):
                             if first_token_ms is None:
@@ -2057,17 +2263,21 @@ def chat_stream(req: ChatReqStream):
                             "ttfb_ms": (first_token_ms - t_llm0) if first_token_ms else None,
                             "sid": req.session_id, "q": text[:120]
                         })
+
+                        # CTA AUTOGENERADO (opciones válidas de compare) — al final
+                        facts_for_cta = {"category": cat, "countries": countries, "with_data": [c for c, _ in with_data]}
+                        yield f"data: {_gen_cta('compare', facts_for_cta)}\n\n"
                         yield "data: [FIN]\n\n"
-                        
 
                     return StreamingResponse(
-                        gen(), media_type="text/event-stream",
+                        gen_llm(), media_type="text/event-stream",
                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
                     )
 
-                # --- Respaldo determinista (sin LLM)
-                def gen():
+                # --- Respaldo determinista (sin LLM) con mini-writer humano breve ---
+                def gen_dtrm():
                     try:
+                        # datos agregados para posible VIZ
                         groups = []
                         for c, rows in with_data:
                             prices = [r.get("price") for r in rows if r.get("price") is not None]
@@ -2091,21 +2301,42 @@ def chat_stream(req: ChatReqStream):
                         yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
                     head = " | ".join(countries)
-                    yield f"data: Filtros → categoría: {cat} | países: {head} | tienda: -\n\n"
-                    if without_data:
-                        yield f"data: Aviso: sin registros para: {', '.join(without_data)}\n\n"
+                    yield f"data: Filtros → categoría: {cat} | países: {head} | tienda: -\n\n"  # contexto
+
+                    # Mini-writer (2–3 frases, sin CTA)
+                    try:
+                        brief_facts = {"category": cat, "groups": groups}
+                        p = (
+                            "Escribe 2–3 frases en español, tono profesional y natural, sin markdown, "
+                            "que expliquen la comparación entre países para la categoría indicada. "
+                            "Incluye una frase de saludo corto y otra con lectura de promedios/mín/máx. "
+                            "No añadas CTA ni instrucciones.\n"
+                            f"Hechos(JSON): {json.dumps(brief_facts, ensure_ascii=False)}"
+                        )
+                        txt = (llm_chat.generate(p) or "").strip()
+                        if txt:
+                            yield f"data: {txt}\n\n"
+                    except Exception:
+                        # fallback muy simple si el LLM no responde
+                        yield "data: Hola, te comparto la comparación por país basada en promedios, mínimos y máximos observados.\n\n"
+
+                    # Lista compacta de ejemplos por país
                     for c, rows in with_data:
                         yield f"data: — País {c}: mostrando hasta {top_per_country} producto(s)\n\n"
                         for i, r in enumerate(rows[:top_per_country], start=1):
                             yield f"data: {_fmt_row(r, i)}\n\n"
+
+                    # CTA AUTOGENERADO — al final
+                    facts_for_cta = {"category": cat, "countries": countries, "with_data": [c for c, _ in with_data]}
+                    yield f"data: {_gen_cta('compare', facts_for_cta)}\n\n"
                     yield "data: [FIN]\n\n"
 
                 return StreamingResponse(
-                    gen(), media_type="text/event-stream",
+                    gen_dtrm(), media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
                 )
 
-            # --- Fallback: comparación simple cuando no hay (N países + categoría) ---
+            # === Fallback: comparación simple cuando no hay (N países + categoría) ===
             effective_q = pick_effective_query(
                 text, req.session_id, prefer_last_cat=not bool((plan.filters or {}).get("category"))
             )
@@ -2122,9 +2353,20 @@ def chat_stream(req: ChatReqStream):
                 "effective_query": effective_q,
                 "ids": [h.get("product_id") for h in (hits or [])],
             })
+
             if len(hits) < 2:
-                reason = _diagnose_no_results("compare", plan=plan, text=text, hits=hits)
+                reason = _diagnose_no_results("compare", plan=plan, text=text, hits=hits, filters=plan.filters)
                 return StreamingResponse(_sse_no_data_ex(reason, plan.filters), media_type="text/event-stream")
+
+            # Persistimos aquí (NO hay with_data en este camino)
+            remember_session(
+                req.session_id,
+                filters=plan.filters,
+                intent="compare",
+                query=text,
+                hits=len(hits),
+                mentioned=mentioned,
+            )
 
             def gen_single():
                 try:
@@ -2133,8 +2375,10 @@ def chat_stream(req: ChatReqStream):
                     vizp = None
                 if vizp:
                     yield f"data: [VIZ_PROMPT] {vizp}\n\n"
-                yield f"data: Filtros → país: {(plan.filters or {}).get('country') or '-'} | categoría: {(plan.filters or {}).get('category') or '-'} | tienda: {(plan.filters or {}).get('store') or '-'}\n\n"
-                # --- Mini-writer humano (no stream) para saludo + contexto + mini-comparación + CTA ---
+
+                yield f"data: Filtros → país: {(plan.filters or {}).get('country') or '-'} | categoría: {(plan.filters or {}).get('category') or '-'} | tienda: {(plan.filters or {}).get('store') or '-'}\n\n"  # contexto
+
+                # Mini-writer humano (sin CTA)
                 try:
                     sample = [
                         {
@@ -2147,9 +2391,10 @@ def chat_stream(req: ChatReqStream):
                         } for h in hits[:2]
                     ]
                     prompt_summary = (
-                        "Eres el asistente del SPI. Responde con: saludo breve → contexto "
-                        "(categoría/país/tienda si están) → mini-comparación clara de los 2 resultados "
-                        "→ CTA único (p.ej., \"¿Quieres que lo ordene o convertir a la misma moneda?\").\n"
+                        "Eres el asistente del SPI. Escribe 2–3 frases, sin markdown: "
+                        "1) saludo breve; 2) contexto (categoría/país/tienda si están); "
+                        "3) mini-comparación clara de los 2 resultados con precios/moneda. "
+                        "No incluyas CTA.\n"
                         f"Contexto: filtros={json.dumps(plan.filters or {}, ensure_ascii=False)}\n"
                         f"Ejemplos(JSON): {json.dumps(sample, ensure_ascii=False)}"
                     )
@@ -2162,6 +2407,10 @@ def chat_stream(req: ChatReqStream):
                 yield "data: Comparativa simple (primeros 2 resultados):\n\n"
                 for i, h in enumerate(hits[:2], start=1):
                     yield f"data: {_fmt_row(h, i)}\n\n"
+
+                # CTA AUTOGENERADO — al final
+                facts_for_cta = {"filters": plan.filters or {}, "hits": len(hits)}
+                yield f"data: {_gen_cta('compare', facts_for_cta)}\n\n"
                 yield "data: [FIN]\n\n"
 
             return StreamingResponse(gen_single(), media_type="text/event-stream")
@@ -2170,6 +2419,7 @@ def chat_stream(req: ChatReqStream):
             _log_event("chat_stream_compare_error", {"sid": req.session_id, "err": str(e)[:200]})
             reason = f"ocurrió un error interno ({type(e).__name__})."
             return StreamingResponse(_sse_no_data_ex(reason, plan.filters), media_type="text/event-stream")
+
 
 
     # ---- AGGREGATE → stream de resumen agregado ----
@@ -2183,7 +2433,7 @@ def chat_stream(req: ChatReqStream):
             reason = f"ocurrió un error interno ({type(e).__name__})."
             return StreamingResponse(_sse_no_data_ex(reason, plan.filters), media_type="text/event-stream")
 
-        remember_session(req.session_id, filters=plan.filters, intent="aggregate", query=text, hits=[])
+        remember_session(req.session_id, filters=plan.filters, intent="aggregate", query=text, hits=1 if agg else 0, mentioned=mentioned)
         _log_event("chat_stream_aggregate", {
             "sid": req.session_id,
             "filters": plan.filters,
@@ -2239,6 +2489,8 @@ def chat_stream(req: ChatReqStream):
                 "q": text[:120],
                 "sid": req.session_id
             })
+            facts_for_cta = {"filters": plan.filters or {}, "group_by": plan.group_by or "category", "groups_n": len(agg.get('groups', []))}
+            yield f"data: {_gen_cta('aggregate', facts_for_cta)}\n\n"
             yield "data: [FIN]\n\n"
 
 
@@ -2280,7 +2532,7 @@ def chat_stream(req: ChatReqStream):
         reason = f"ocurrió un error interno ({type(e).__name__})."
         return StreamingResponse(_sse_no_data_ex(reason, plan.filters), media_type="text/event-stream")
 
-    remember_session(req.session_id, filters=plan.filters, intent="lookup", query=text, hits=hits)
+    remember_session(req.session_id, filters=plan.filters, intent="lookup", query=text,  hits=len(hits), mentioned=mentioned)
     _log_event("chat_stream_lookup", {
         "sid": req.session_id,
         "filters": plan.filters,
@@ -2405,6 +2657,9 @@ def chat_stream(req: ChatReqStream):
             "sid": req.session_id,
         })
 
+
+        facts_for_cta = {"filters": plan.filters or {}, "hits": len(hits), "brands_n": len(brands)}
+        yield f"data: {_gen_cta('lookup', facts_for_cta)}\n\n"
         yield "data: [FIN]\n\n"
 
     return StreamingResponse(gen_lookup(), media_type="text/event-stream")
