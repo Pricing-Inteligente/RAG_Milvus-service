@@ -268,7 +268,8 @@ CAT_ALIASES = {
     # refrescos de cola
     "refrescos_de_cola": [
         "refresco de cola", "refrescos de cola", "gaseosa", "gaseosas",
-        "gaseosa de cola", "soda", "cola", "coca cola", "coca-cola"
+        "gaseosa de cola", "soda", "cola", "coca cola", "coca-cola",
+        "refrigerio", "refrigerios"
     ],
 
     # papa
@@ -1375,11 +1376,16 @@ def chat_stream(req: ChatReqStream):
     force_topn = _is_topn_query(nt)
     force_trend = _is_trend_query(nt)
 
+    # Prioriza productos si el usuario habla explícitamente de precios/valores
+    # y hay indicios de categoría (alias) en el mismo turno.
+    heur_now_priority = _guess_filters(text)
+    has_products_priority = bool(heur_now_priority.get("category")) or bool(re.search(r"\b(precio|precios|valor(?:es)?)\b", nt))
+
 
 
         # ------ RUTA MACRO (stream) ------
     macros = _extract_macros(text)
-    if macros:
+    if macros and not has_products_priority:
         countries = _extract_countries(text) or []
         if not countries and req.session_id:
             last = MEM.get(req.session_id) or {}
