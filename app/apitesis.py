@@ -10,7 +10,7 @@ from datetime import datetime
 from collections import OrderedDict
 # cerca de otros helpers de Milvus
 from retrieve_macro import macro_list, macro_lookup, macro_compare, _macro_default_countries, _macro_rank
-
+from retrieve_lasso import query_lasso_models
 import time
 
 
@@ -25,6 +25,141 @@ from retrieve import retrieve, list_by_filter, aggregate_prices
 # Inteligencia de intención / categoría 
 from intent_llm import parse_intent
 from category_resolver import resolve_category_semantic
+
+
+
+# --- LASSO / Influencia (solo México) ---
+LASSO_COLLECTION = os.getenv("LASSO_COLLECTION", "lasso_models")
+
+LASSO_KEYWORDS = {
+    "influencia", "influenciar", "impacto", "descomposicion", "descomposición",
+    "grado", "coeficiente", "coeficientes", "variacion", "variación", "sensibilidad",
+    "afecta", "afectan"
+}
+
+# para bloquear países distintos a MX si aparecen explícitos
+NON_MX_COUNTRIES = {
+    "argentina","brasil","brasil","br","chile","cl","colombia","co","peru","pe",
+    "panama","pa","uruguay","uy","paraguay","py","ecuador","ec","bolivia","bo",
+    "venezuela","ve","guatemala","gt","costa rica","cr","honduras","hn","nicaragua","ni",
+    "el salvador","sv","mexico df","méxico df"  # <- no bloquea, solo ejemplos de texto
+}
+
+
+import re
+
+# Países distintos a MX (nombres) y sus códigos ISO2
+_NON_MX_WORDS = [
+    "argentina","brasil","brazil","chile","colombia","peru","panama","uruguay",
+    "paraguay","ecuador","bolivia","venezuela","guatemala","costa rica",
+    "honduras","nicaragua","el salvador"
+]
+_NON_MX_ISO2 = ["ar","br","cl","co","pe","pa","uy","py","ec","bo","ve","gt","cr","hn","ni","sv"]
+
+# Detectores robustos con límites de palabra
+_NON_MX_REGEX = re.compile(
+    r"\b(" + "|".join(map(re.escape, _NON_MX_WORDS)) + r")\b|\b(" + "|".join(_NON_MX_ISO2) + r")\b",
+    flags=re.IGNORECASE
+)
+_MX_REGEX = re.compile(r"\b(m[eé]xico|mx)\b", flags=re.IGNORECASE)
+
+
+def detect_lasso_influence_intent(message: str) -> dict | None:
+    text = (message or "").strip().lower()
+    if not any(k in text for k in LASSO_KEYWORDS):
+        return None
+
+    # Bloquea solo si se menciona otro país y NO aparece MX
+    if _NON_MX_REGEX.search(text) and not _MX_REGEX.search(text):
+        return {"intent": "lasso_influence_blocked_non_mx"}
+
+    # --- 1) MARCA explícita ---
+    m = re.search(r"(?:de\s+la\s+marca|de\s+marca|marca)\s+([a-z0-9\-\.\s_]+)", text, flags=re.IGNORECASE)
+    if m:
+        term = re.sub(r"\s+", " ", m.group(1)).strip(" ._-")
+        return {"intent": "lasso_influence", "by": "brand", "term": term}
+
+    # --- 2) PRODUCTO: “en/sobre <producto> de/en méxico” (captura solo el producto)
+    m3 = re.search(
+        r"(?:en|sobre)\s+(?:el|la|los|las)?\s*([a-z0-9_áéíóúñ\-\s]+?)\s+(?:de|en)\s+m[eé]xico\b",
+        text, flags=re.IGNORECASE
+    )
+    if m3:
+        term = re.sub(r"\s+", " ", m3.group(1)).strip(" ._-")
+        return {"intent": "lasso_influence", "by": "product", "term": term}
+
+    # --- 3) FALLBACK: toma lo previo a “de/en méxico”, pero reduce al último token tipo “arroz” ---
+    m2 = re.search(r"([a-z0-9\-\.\s_]+?)\s+(?:de|en)\s+m[eé]xico\b", text, flags=re.IGNORECASE)
+    raw = re.sub(r"\s+", " ", (m2.group(1) if m2 else text)).strip(" ._-")
+    # quita artículos y quédate con la última palabra útil
+    tokens = [t for t in re.split(r"\s+", raw) if t not in {"de","en","la","el","las","los"}]
+    term = tokens[-1] if tokens else raw
+
+    return {"intent": "lasso_influence", "by": "product", "term": term}
+
+
+
+
+def _format_lasso_answer(rows: list[dict], by: str, term: str) -> str:
+    """
+    Estructura: saludo → contexto LASSO → hallazgos → CTA
+    """
+    if not rows:
+        return (
+            "Hola.\n\n"
+            "Esta descomposición LASSO solo está disponible para **México** y no encontré ese "
+            f"{'producto' if by=='product' else 'marca'} en los modelos. "
+            f"¿Quieres que pruebe con otra {'marca' if by=='brand' else 'presentación'}?"
+        )
+
+    # elige el mejor por R²
+    best = max(rows, key=lambda r: (r.get("r_squared") or 0.0))
+
+    coef_map = [
+        ("coef_inflation_rate_pct_change", "Inflación general (%)"),
+        ("coef_cambio_dolar_pct_change",   "Tipo de cambio USD/MXN (%)"),
+        ("coef_cpi_pct_change",            "CPI / IPC (%)"),
+        ("coef_interest_rate_pct_change",  "Tasa de interés (%)"),
+        ("coef_gdp_pct_change",            "PIB (%)"),
+        ("coef_producer_prices_pct_change","Precios al productor (%)"),
+        ("coef_gini_pct_change",           "Índice Gini (%)"),
+    ]
+
+    coefs = []
+    for k, label in coef_map:
+        v = best.get(k)
+        if v is None: 
+            continue
+        coefs.append((label, float(v)))
+
+    # ordenar por magnitud
+    coefs.sort(key=lambda x: abs(x[1]), reverse=True)
+    bullets = []
+    for label, v in coefs:
+        efecto = "↑ sube" if v > 0 else ("↓ baja" if v < 0 else "≈ neutro")
+        bullets.append(f"- {label}: {v:.4f} ({efecto} el precio)")
+
+    nombre = best.get("nombre") or (best.get("producto") or best.get("marca") or term)
+    marca  = best.get("marca") or "-"
+    prod   = best.get("producto") or "-"
+    retail = best.get("retail") or "-"
+    r2     = best.get("r_squared") or 0.0
+    alpha  = best.get("best_alpha") or 0.0
+    nobs   = int(best.get("n_obs") or 0)
+
+    contexto = (
+        "Usamos una regresión LASSO entrenada con historiales de **precios en México** y "
+        "variables macro oficiales. LASSO selecciona variables y sus coeficientes se interpretan "
+        "como influencia marginal sobre el precio (positivos empujan al alza; negativos, a la baja).\n"
+    )
+
+    hallazgos = "**Variables con mayor influencia (por magnitud):**\n" + "\n".join(bullets[:7])
+
+    meta = f"\n\nModelo: {nombre} · Marca: {marca} · Producto: {prod} · Retail: {retail} · R²: {r2:.3f} · α: {alpha:.4f} · Obs: {nobs}"
+    cta  = "\n\n¿Quieres comparar con otra marca/producto o que simule un what-if (por ejemplo, +1 pp en inflación)?"
+
+    return "Hola.\n\n" + contexto + hallazgos + meta + cta
+
 
 
 
@@ -1041,7 +1176,16 @@ def _cta_options(intent: str, facts: dict) -> list[str]:
             "¿Quieres comparar otra categoría?",
         ]
 
+    # === NUEVO: CTA para influencia LASSO ===
+    if intent == "lasso_influence":
+        return [
+            "¿Quieres comparar la influencia con otra marca o producto?",
+            "¿Te muestro la descomposición para otra presentación del producto?",
+            "¿Simulamos un what-if sencillo (por ejemplo, +1 pp en inflación)?",
+        ]
+
     return ["¿Quieres que profundice?"]
+
 
 
 def _prompt_cta_from_facts(intent: str, facts: dict) -> str:
@@ -1099,6 +1243,22 @@ def _prompt_macro_humano(intent: str, facts: dict, hint_cta: str, include_cta: b
 
 
 
+def _prompt_lasso_humano(facts: dict, hint_cta: str | None = None, include_cta: bool = True) -> str:
+    import json
+    base = (
+        "Eres el asistente del SPI. Escribe en español, tono cercano y profesional. "
+        "Devuelve 3–6 frases de TEXTO PLANO (sin markdown, sin viñetas). "
+        "Estructura: 1) saludo amable; 2) contexto breve: explicas que LASSO estima "
+        "coeficientes que representan la influencia marginal de variables macro en el precio; "
+        "3) respuesta: menciona las variables con mayor magnitud y su signo (sube/baja el precio); "
+        "4) cierra con R², alfa y el número de observaciones, citando la descripción del producto y el retail. "
+        "No inventes nada que no esté en los hechos."
+    )
+    if include_cta and hint_cta:
+        base += f" Termina con un único CTA: {hint_cta}"
+    else:
+        base += " No incluyas CTA."
+    return base + f"\nHECHOS(JSON): {json.dumps(facts, ensure_ascii=False)}\nRespuesta:"
 
 
 
@@ -1745,6 +1905,97 @@ def chat_stream(req: ChatReqStream):
             yield "data: [FIN]\n\n"
 
         return StreamingResponse(gen_multi(), media_type="text/event-stream")
+
+
+    # --- LASSO: influencia/descomposición solo para México ---
+    # --- LASSO: influencia/descomposición solo para México ---
+    lasso_plan = detect_lasso_influence_intent(text)
+    if lasso_plan:
+        if lasso_plan.get("intent") == "lasso_influence_blocked_non_mx":
+            def gen_block():
+                yield "data: Hola. La descomposición por coeficientes LASSO solo está disponible para México por ahora.\n\n"
+                yield "data: ¿Busco la influencia para ese producto o marca en México?\n\n"
+                yield "data: [FIN]\n\n"
+            return StreamingResponse(gen_block(), media_type="text/event-stream")
+
+        # 1) Consulta a Milvus
+        rows = query_lasso_models(lasso_plan["by"], lasso_plan["term"], topk=5)
+
+        # 2) Sin filas → mensaje claro
+        if not rows:
+            def gen_empty():
+                yield "data: Filtros → país: MX | categoría: - | tienda: -\n\n"
+                yield ("data: Hola. La descomposición LASSO está disponible para México, "
+                    f"pero no encontré esa {('marca' if lasso_plan['by']=='brand' else 'presentación')} "
+                    "en los modelos. ¿Quieres que pruebe con otra marca o producto?\n\n")
+                yield "data: [FIN]\n\n"
+            return StreamingResponse(gen_empty(), media_type="text/event-stream")
+
+        # 3) Tomamos el mejor por R² y armamos HECHOS para el writer
+        best = max(rows, key=lambda r: (r.get('r_squared') or 0.0))
+        coefs = [
+            {"name": "Inflación general (%)",          "value": best.get("coef_inflation_rate_pct_change")},
+            {"name": "Tipo de cambio USD/MXN (%)",     "value": best.get("coef_cambio_dolar_pct_change")},
+            {"name": "CPI / IPC (%)",                  "value": best.get("coef_cpi_pct_change")},
+            {"name": "Tasa de interés (%)",            "value": best.get("coef_interest_rate_pct_change")},
+            {"name": "PIB (%)",                        "value": best.get("coef_gdp_pct_change")},
+            {"name": "Precios al productor (%)",       "value": best.get("coef_producer_prices_pct_change")},
+            {"name": "Índice Gini (%)",                "value": best.get("coef_gini_pct_change")},
+        ]
+        coefs = [c for c in coefs if c["value"] is not None]
+        # ordena por magnitud
+        coefs.sort(key=lambda c: abs(float(c["value"] or 0.0)), reverse=True)
+
+        facts_lasso = {
+            "type": "lasso_influence",
+            "by": lasso_plan["by"],
+            "term": lasso_plan["term"],
+            "country": "MX",
+            "product_desc": best.get("nombre"),
+            "brand": best.get("marca"),
+            "product": best.get("producto"),
+            "retail": best.get("retail"),
+            "r2": float(best.get("r_squared") or 0.0),
+            "alpha": float(best.get("best_alpha") or 0.0),
+            "n_obs": int(best.get("n_obs") or 0),
+            "coefs": [{"name": c["name"], "value": float(c["value"])} for c in coefs],
+        }
+
+        # 4) CTA generado por LLM (opciones válidas para 'lasso_influence')
+        cta_lasso = _gen_cta("lasso_influence", facts_lasso)
+
+        def gen_lasso():
+            # Encabezado de filtros consistente con el front
+            yield "data: Filtros → país: MX | categoría: - | tienda: -\n\n"
+
+            # Writer humano (saludo + contexto LASSO + respuesta). SIN CTA aquí:
+            prompt = _prompt_lasso_humano(facts_lasso, hint_cta=None, include_cta=False)
+            for chunk in _stream_no_fin(prompt):
+                yield chunk
+            yield "data: \n\n"
+
+            # Etiqueta de “Descripción del producto” (antes decía 'Modelo')
+            base_desc = best.get("nombre") or best.get("producto") or best.get("marca") or "-"
+            yield f"data: Descripción del producto base: {base_desc}\n\n"
+
+            # CTA final (1 sola pregunta)
+            yield f"data: {cta_lasso}\n\n"
+            yield "data: [FIN]\n\n"
+
+        # Memoria mínima de sesión
+        try:
+            remember_session(req.session_id,
+                            filters={"country": "MX"},
+                            intent="lasso_influence",
+                            query=text,
+                            hits=len(rows),
+                            mentioned={"country": True})
+        except Exception:
+            pass
+
+        return StreamingResponse(gen_lasso(), media_type="text/event-stream")
+
+
 
 
 
