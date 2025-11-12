@@ -1248,9 +1248,9 @@ def _prompt_lasso_humano(facts: dict, hint_cta: str | None = None, include_cta: 
     base = (
         "Eres el asistente del SPI. Escribe en español, tono cercano y profesional. "
         "Devuelve 3–6 frases de TEXTO PLANO (sin markdown, sin viñetas). "
-        "Estructura: 1) saludo amable; 2) contexto breve: explicas que LASSO estima "
+        "Estructura: 1) saludo amable; 2) contexto breve: explicas que LASSO estima y cuales fueron los valores de los coeficientes de las variables "
         "coeficientes que representan la influencia marginal de variables macro en el precio; "
-        "3) respuesta: menciona las variables con mayor magnitud y su signo (sube/baja el precio); "
+        "3) respuesta: menciona las variables con mayor magnitud, su valor y su signo (sube/baja el precio); "
         "4) cierra con R², alfa y el número de observaciones, citando la descripción del producto y el retail. "
         "No inventes nada que no esté en los hechos."
     )
