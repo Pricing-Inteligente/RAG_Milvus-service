@@ -803,6 +803,9 @@ def _maybe_viz_prompt(
             return _viz_prompt_from_generic("topn", filters, user_prompt=user_prompt, rag_response=rag_response)
         if intent == "trend" and series:
             return _viz_prompt_from_generic("trend", filters, user_prompt=user_prompt, rag_response=rag_response)
+        # LASSO: usa el mismo esquema genérico basado en la respuesta RAG
+        if intent == "lasso_influence":
+            return _viz_prompt_from_generic("lasso_influence", filters, user_prompt=user_prompt, rag_response=rag_response)
     except Exception:
         return None
     return None
@@ -1257,11 +1260,11 @@ def _prompt_lasso_humano(facts: dict, hint_cta: str | None = None, include_cta: 
     base = (
         "Eres el asistente del SPI. Escribe en español, tono cercano y profesional. "
         "Devuelve 3–6 frases de TEXTO PLANO (sin markdown, sin viñetas). "
-        "Estructura: 1) saludo amable; 2) contexto breve: explicas que LASSO estima y cuales fueron los valores de los coeficientes de las variables "
-        "coeficientes que representan la influencia marginal de variables macro en el precio; "
+        "Estructura: 1) saludo amable; 2) contexto breve: explica que LASSO estima y cuáles fueron los valores de los coeficientes; "
         "3) respuesta: menciona las variables con mayor magnitud, su valor y su signo (sube/baja el precio); "
         "4) cierra con R², alfa y el número de observaciones, citando la descripción del producto y el retail. "
-        "No inventes nada que no esté en los hechos."
+        "REGLA CRÍTICA: Usa ÚNICAMENTE los datos provistos en HECHOS(JSON). No consultes ni asumas información adicional. "
+        "Si algún dato no aparece en HECHOS, indica 'no disponible'. No inventes cifras ni contexto externo."
     )
     if include_cta and hint_cta:
         base += f" Termina con un único CTA: {hint_cta}"
@@ -1979,9 +1982,30 @@ def chat_stream(req: ChatReqStream):
 
             # Writer humano (saludo + contexto LASSO + respuesta). SIN CTA aquí:
             prompt = _prompt_lasso_humano(facts_lasso, hint_cta=None, include_cta=False)
+            rag_buf = []
             for chunk in _stream_no_fin(prompt):
+                try:
+                    content = chunk.split("data:", 1)[1].strip()
+                except Exception:
+                    content = chunk
+                if content and content != "[FIN]":
+                    rag_buf.append(content)
                 yield chunk
             yield "data: \n\n"
+
+            # VIZ_PROMPT (basado en la respuesta RAG de LASSO)
+            try:
+                full_resp = " ".join(rag_buf).strip()
+                vizp = _maybe_viz_prompt(
+                    "lasso_influence",
+                    {"country": "MX"},
+                    user_prompt=text,
+                    rag_response=full_resp,
+                )
+            except Exception:
+                vizp = None
+            if vizp:
+                yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
             # Etiqueta de “Descripción del producto” (antes decía 'Modelo')
             base_desc = best.get("nombre") or best.get("producto") or best.get("marca") or "-"
@@ -2046,7 +2070,14 @@ def chat_stream(req: ChatReqStream):
                 }
                 hint = f"El {'más alto' if superl=='max' else 'más bajo'} es {best['country']} ({best['value']} {best.get('unit') or ''} {best.get('date') or ''}). ¿Quieres comparar los 3 primeros?"
                 prompt = _prompt_macro_humano("macro_rank", facts, hint)
+                rag_buf = []
                 for chunk in _stream_no_fin(prompt):
+                    try:
+                        content = chunk.split("data:", 1)[1].strip()
+                    except Exception:
+                        content = chunk
+                    if content and content != "[FIN]":
+                        rag_buf.append(content)
                     yield chunk
                 yield "data: \n\n"
 
@@ -2057,9 +2088,23 @@ def chat_stream(req: ChatReqStream):
                 for i, r in enumerate(ranked[:topn], start=1):
                     yield f"data: {i}. {r['country']}: {r['value']} {r.get('unit') or ''} ({r.get('date') or ''})\n\n"
 
+                # VIZ_PROMPT (macro rank/topN)
+                try:
+                    full_resp = " ".join(rag_buf).strip()
+                    vizp = _maybe_viz_prompt(
+                        "topn",
+                        {"country": cs},
+                        rows=ranked[:topn],
+                        user_prompt=text,
+                        rag_response=full_resp,
+                    )
+                except Exception:
+                    vizp = None
+                if vizp:
+                    yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
-                facts_for_cta = {"filters": plan.filters or {}, "n": len(top), "mode": mode}
-                yield f"data: {_gen_cta('topn', facts_for_cta)}\n\n"
+                # CTA final (coherente con otros flujos macro)
+                yield f"data: {_gen_cta('macro_rank', facts)}\n\n"
                 yield "data: [FIN]\n\n"
 
             return StreamingResponse(gen_super(), media_type="text/event-stream")
@@ -2098,9 +2143,31 @@ def chat_stream(req: ChatReqStream):
                                 ]
                             }
                             prompt = _prompt_macro_humano("macro_list", facts, " ", include_cta=False)
+                            rag_buf = []
                             for chunk in _stream_no_fin(prompt):
+                                try:
+                                    content = chunk.split("data:", 1)[1].strip()
+                                except Exception:
+                                    content = chunk
+                                if content and content != "[FIN]":
+                                    rag_buf.append(content)
                                 yield chunk
                             yield "data: \n\n"
+
+                            # VIZ_PROMPT (lista de variables del país)
+                            try:
+                                full_resp = " ".join(rag_buf).strip()
+                                vizp = _maybe_viz_prompt(
+                                    "list",
+                                    {"country": countries[0]},
+                                    rows=rows[:10],
+                                    user_prompt=text,
+                                    rag_response=full_resp,
+                                )
+                            except Exception:
+                                vizp = None
+                            if vizp:
+                                yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
                     elif len(countries) >= 2:
                         rows = macro_compare(m, countries) or []
@@ -2117,9 +2184,31 @@ def chat_stream(req: ChatReqStream):
                                 ]
                             }
                             prompt = _prompt_macro_humano("macro_compare", facts, " ", include_cta=False)
+                            rag_buf = []
                             for chunk in _stream_no_fin(prompt):
+                                try:
+                                    content = chunk.split("data:", 1)[1].strip()
+                                except Exception:
+                                    content = chunk
+                                if content and content != "[FIN]":
+                                    rag_buf.append(content)
                                 yield chunk
                             yield "data: \n\n"
+
+                            # VIZ_PROMPT (comparación de variable entre países)
+                            try:
+                                full_resp = " ".join(rag_buf).strip()
+                                vizp = _maybe_viz_prompt(
+                                    "compare",
+                                    {"country": countries},
+                                    rows=rows,
+                                    user_prompt=text,
+                                    rag_response=full_resp,
+                                )
+                            except Exception:
+                                vizp = None
+                            if vizp:
+                                yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
                     else:
                         r = macro_lookup(m, countries[0]) if len(countries) == 1 else None
@@ -2135,9 +2224,31 @@ def chat_stream(req: ChatReqStream):
                                 "name": (r or {}).get("name"),
                             }
                             prompt = _prompt_macro_humano("macro_lookup", facts, " ", include_cta=False)
+                            rag_buf = []
                             for chunk in _stream_no_fin(prompt):
+                                try:
+                                    content = chunk.split("data:", 1)[1].strip()
+                                except Exception:
+                                    content = chunk
+                                if content and content != "[FIN]":
+                                    rag_buf.append(content)
                                 yield chunk
                             yield "data: \n\n"
+
+                            # VIZ_PROMPT (lookup de variable en un país)
+                            try:
+                                full_resp = " ".join(rag_buf).strip()
+                                vizp = _maybe_viz_prompt(
+                                    "lookup",
+                                    {"country": countries[0]},
+                                    rows=[r] if r else None,
+                                    user_prompt=text,
+                                    rag_response=full_resp,
+                                )
+                            except Exception:
+                                vizp = None
+                            if vizp:
+                                yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
                 # --- Sección PRODUCTOS ---
                 pf2 = dict(pf)
@@ -2201,9 +2312,31 @@ def chat_stream(req: ChatReqStream):
                         ]
                     }
                     prompt = _prompt_macro_humano("macro_list", facts, "¿Te muestro solo inflación, tasa o dólar?")
+                    rag_buf = []
                     for chunk in _stream_no_fin(prompt):
+                        try:
+                            content = chunk.split("data:", 1)[1].strip()
+                        except Exception:
+                            content = chunk
+                        if content and content != "[FIN]":
+                            rag_buf.append(content)
                         yield chunk
                     yield "data: \n\n"
+
+                    # VIZ_PROMPT (listado macro por país)
+                    try:
+                        full_resp = " ".join(rag_buf).strip()
+                        vizp = _maybe_viz_prompt(
+                            "list",
+                            {"country": countries[0]},
+                            rows=rows[:10],
+                            user_prompt=text,
+                            rag_response=full_resp,
+                        )
+                    except Exception:
+                        vizp = None
+                    if vizp:
+                        yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
                     yield f"data: Encontré {len(rows)} variable(s). Mostrando las primeras:\n\n"
                     for i, r in enumerate(rows[:10], start=1):
@@ -2236,9 +2369,31 @@ def chat_stream(req: ChatReqStream):
                         ]
                     }
                     prompt = _prompt_macro_humano("macro_compare", facts, "¿Agrego otro país o otra variable?")
+                    rag_buf = []
                     for chunk in _stream_no_fin(prompt):
+                        try:
+                            content = chunk.split("data:", 1)[1].strip()
+                        except Exception:
+                            content = chunk
+                        if content and content != "[FIN]":
+                            rag_buf.append(content)
                         yield chunk
                     yield "data: \n\n"
+
+                    # VIZ_PROMPT (comparación multi-país)
+                    try:
+                        full_resp = " ".join(rag_buf).strip()
+                        vizp = _maybe_viz_prompt(
+                            "compare",
+                            {"country": countries},
+                            rows=rows,
+                            user_prompt=text,
+                            rag_response=full_resp,
+                        )
+                    except Exception:
+                        vizp = None
+                    if vizp:
+                        yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
                     for i, r in enumerate(rows, start=1):
                         yield f"data: {_fmt_macro_row(r, i)}\n\n"
@@ -2266,9 +2421,31 @@ def chat_stream(req: ChatReqStream):
                         "name": (r or {}).get("name"),
                     }
                     prompt = _prompt_macro_humano("macro_lookup", facts, "¿La comparamos con otro país o prefieres la serie histórica?")
+                    rag_buf = []
                     for chunk in _stream_no_fin(prompt):
+                        try:
+                            content = chunk.split("data:", 1)[1].strip()
+                        except Exception:
+                            content = chunk
+                        if content and content != "[FIN]":
+                            rag_buf.append(content)
                         yield chunk
                     yield "data: \n\n"
+
+                    # VIZ_PROMPT (lookup de variable)
+                    try:
+                        full_resp = " ".join(rag_buf).strip()
+                        vizp = _maybe_viz_prompt(
+                            "lookup",
+                            {"country": countries[0]},
+                            rows=[r] if r else None,
+                            user_prompt=text,
+                            rag_response=full_resp,
+                        )
+                    except Exception:
+                        vizp = None
+                    if vizp:
+                        yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
                     yield f"data: {_fmt_macro_row(r)}\n\n"
 
