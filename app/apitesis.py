@@ -33,9 +33,9 @@ LASSO_COLLECTION = os.getenv("LASSO_COLLECTION", "lasso_models")
 
 LASSO_KEYWORDS = {
     # núcleo
-    "influencia", "influenciar", "influye", "influyen", "influyó",
+    "influencia", "influenciar", "influye", "influyen", "influyó", "influyo"
     "impacto", "impacta", "impactan",
-    "efecto", "efectos",
+    "efecto", "efectos", "afecto", "afectos",
     "descomposicion", "descomposición",
     # otros
     "grado", "coeficiente", "coeficientes", "variacion", "variación", "sensibilidad",
