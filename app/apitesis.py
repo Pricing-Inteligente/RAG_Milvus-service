@@ -32,7 +32,12 @@ from category_resolver import resolve_category_semantic
 LASSO_COLLECTION = os.getenv("LASSO_COLLECTION", "lasso_models")
 
 LASSO_KEYWORDS = {
-    "influencia", "influenciar", "impacto", "descomposicion", "descomposición",
+    # núcleo
+    "influencia", "influenciar", "influye", "influyen", "influyó",
+    "impacto", "impacta", "impactan",
+    "efecto", "efectos",
+    "descomposicion", "descomposición",
+    # otros
     "grado", "coeficiente", "coeficientes", "variacion", "variación", "sensibilidad",
     "afecta", "afectan"
 }
@@ -158,6 +163,85 @@ def detect_lasso_influence_compare_intent(message: str) -> dict | None:
         return None
 
     return {"intent": "lasso_influence_compare", "terms": [term_a, term_b], "country": "MX"}
+
+
+# --- NUEVO: Detección de influencia de UNA variable específica sobre un producto/marca ---
+_LASSO_VAR_ALIASES = [
+    ("coef_inflation_rate_pct_change", ["inflacion", "inflación", "inflation", "ipc general"]),
+    ("coef_cambio_dolar_pct_change", ["tipo de cambio", "dolar", "dólar", "usd", "tc", "usd/mxn"]),
+    ("coef_cpi_pct_change", ["ipc", "cpi", "indice de precios al consumidor", "índice de precios al consumidor"]),
+    ("coef_interest_rate_pct_change", ["tasa de interes", "tasa de interés", "interes", "interés", "tasas"]),
+    ("coef_gdp_pct_change", ["pib", "producto interno bruto", "gdp"]),
+    ("coef_producer_prices_pct_change", ["precios al productor", "ipp", "ppi", "indice de precios al productor", "índice de precios al productor"]),
+    ("coef_gini_pct_change", ["gini", "indice gini", "índice gini"]),
+]
+
+def _match_lasso_var_key(text: str) -> tuple[str|None, str|None]:
+    t = text.lower()
+    for key, aliases in _LASSO_VAR_ALIASES:
+        for a in aliases:
+            if re.search(rf"\b{re.escape(a)}\b", t):
+                # Regresa key y una etiqueta humana aproximada
+                label_map = {
+                    "coef_inflation_rate_pct_change": "Inflación general (%)",
+                    "coef_cambio_dolar_pct_change": "Tipo de cambio USD/MXN (%)",
+                    "coef_cpi_pct_change": "CPI / IPC (%)",
+                    "coef_interest_rate_pct_change": "Tasa de interés (%)",
+                    "coef_gdp_pct_change": "PIB (%)",
+                    "coef_producer_prices_pct_change": "Precios al productor (%)",
+                    "coef_gini_pct_change": "Índice Gini (%)",
+                }
+                return key, label_map.get(key)
+    return None, None
+
+def detect_lasso_variable_influence_intent(message: str) -> dict | None:
+    text_raw = (message or "").strip()
+    text = text_raw.lower()
+    # Debe hablar de influencia/impacto/efecto/descomposición
+    if not any(k in text for k in LASSO_KEYWORDS):
+        return None
+    # Bloque países no MX explícitos
+    if _NON_MX_REGEX.search(text) and not _MX_REGEX.search(text):
+        return None
+
+    # Detectar variable
+    var_key, var_label = _match_lasso_var_key(text)
+    if not var_key:
+        return None
+
+    # Extraer producto/marca (similar a compare): usa lo posterior a 'precios de' o al último ' de '
+    # Primero descarta la parte donde detectaste la variable para evitar capturarla de nuevo
+    t2 = re.sub(r"\b(influencia|influye|influyen|impacto|impacta|impactan|efecto|efectos|descomposici[oó]n)\b", " ", text)
+    # Captura producto tras 'precios de'
+    m = re.search(r"precios?\s+de\s+(.+)$", t2)
+    if m:
+        cand = m.group(1)
+    else:
+        # Busca 'en <producto>' o 'de <producto>'
+        m2 = re.search(r"(?:en|sobre|para)\s+(?:los|las|el|la)?\s*(.+)$", t2)
+        cand = m2.group(1) if m2 else t2
+    # separa por ' y ' o coma y toma un solo término (una variable → un producto)
+    parts = [p.strip() for p in re.split(r"\s+y\s+|,", cand) if p.strip()]
+    # escoger el primer término como producto
+    prod_raw = parts[0] if parts else cand
+
+    STOP = {"muestrame","muéstrame","descomposicion","descomposición","precios","precio","de","del","la","el","los","las",
+            "influencia","impacto","coeficientes","coeficiente","en","mexico","méxico","variables","variable","presentacion","presentación",
+            "producto","productos","marca","marcas"}
+    tokens = [re.sub(r"[^a-z0-9áéíóúñ%/]", "", w) for w in re.split(r"\s+", prod_raw)]
+    tokens = [w for w in tokens if w and w not in STOP]
+    if not tokens:
+        return None
+    term = " ".join(tokens[-2:])
+
+    return {
+        "intent": "lasso_var_influence",
+        "var_key": var_key,
+        "var_label": var_label or var_key,
+        "by": "product",
+        "term": term,
+        "country": "MX",
+    }
 
 
 
@@ -870,6 +954,8 @@ def _maybe_viz_prompt(
             return _viz_prompt_from_generic("lasso_influence", filters, user_prompt=user_prompt, rag_response=rag_response)
         if intent == "lasso_influence_compare":
             return _viz_prompt_from_generic("lasso_influence_compare", filters, user_prompt=user_prompt, rag_response=rag_response)
+        if intent == "lasso_var_influence":
+            return _viz_prompt_from_generic("lasso_var_influence", filters, user_prompt=user_prompt, rag_response=rag_response)
     except Exception:
         return None
     return None
@@ -1352,6 +1438,25 @@ def _prompt_lasso_compare(facts: dict, hint_cta: str | None = None, include_cta:
         "No menciones países distintos de MX; si no hay país en HECHOS, di 'no disponible'. "
         "No agregues bibliografía, referencias ni pasos de procedimiento. "
         "Responde SOLO con el texto final, en un único bloque claro, sin listas, sin títulos, sin código, sin JSON."
+    )
+    if include_cta and hint_cta:
+        base += f" Termina con un único CTA: {hint_cta}"
+    else:
+        base += " No incluyas CTA."
+    return base + f"\nHECHOS(JSON): {json.dumps(facts, ensure_ascii=False)}\nRespuesta:"
+
+
+# --- NUEVO: Prompt para influencia de UNA variable sobre un producto ---
+def _prompt_lasso_var(facts: dict, hint_cta: str | None = None, include_cta: bool = True) -> str:
+    import json
+    base = (
+        "Eres el asistente del SPI. Escribe en español, tono cercano y profesional. "
+        "Devuelve 3–6 frases de TEXTO PLANO (sin markdown, sin viñetas). "
+        "Estructura: 1) saludo amable; 2) contexto breve: explica que LASSO estima coeficientes y que se reporta SOLO la variable indicada; "
+        "3) respuesta: indica el coeficiente de esa variable para el producto (valor y signo: sube/baja) o 'no disponible' si falta; "
+        "4) cierra con R², alfa y n_obs del modelo, citando la descripción del producto y el retail. "
+        "REGLAS CRÍTICAS: Usa ÚNICAMENTE HECHOS(JSON); no inventes ni supongas. Sin nombres de personas, sin CSV/JSON/‘Document’/‘Instruction’, sin meta-explicaciones. No inventes nada, usa solo datos de tu base de conocimiento. "
+        "Responde SOLO con el texto final, en un único bloque claro."
     )
     if include_cta and hint_cta:
         base += f" Termina con un único CTA: {hint_cta}"
@@ -1950,6 +2055,89 @@ def chat_stream(req: ChatReqStream):
             except Exception:
                 pass
             return StreamingResponse(gen_cmp_early(), media_type="text/event-stream")
+
+    # --- DETECCIÓN TEMPRANA: influencia de UNA variable en un producto/marca ---
+    try:
+        early_lasso_var = detect_lasso_variable_influence_intent(text)
+    except Exception:
+        early_lasso_var = None
+    if early_lasso_var and early_lasso_var.get("intent") == "lasso_var_influence":
+        var_key = early_lasso_var.get("var_key")
+        var_label = early_lasso_var.get("var_label")
+        term = early_lasso_var.get("term")
+        # Busca modelo por producto; fallback a marca
+        rows = query_lasso_models("product", term, topk=5) or []
+        if not rows:
+            rows = query_lasso_models("brand", term, topk=5) or []
+        if not rows:
+            def gen_empty_var():
+                yield "data: Filtros → país: MX | variable: {var_label} | producto: {term}\n\n".format(var_label=var_label, term=term)
+                yield "data: No encontré modelos LASSO para ese producto o marca en México. ¿Intento con otro?\n\n"
+                yield "data: [FIN]\n\n"
+            return StreamingResponse(gen_empty_var(), media_type="text/event-stream")
+
+        best = max(rows, key=lambda r: (r.get("r_squared") or 0.0))
+        coef_val = best.get(var_key)
+        coef_val_f = float(coef_val) if coef_val is not None else None
+        facts_var = {
+            "type": "lasso_var_influence",
+            "country": "MX",
+            "term": term,
+            "var_key": var_key,
+            "var_label": var_label,
+            "product_desc": best.get("nombre") or best.get("producto") or term,
+            "brand": best.get("marca"),
+            "retail": best.get("retail"),
+            "r2": float(best.get("r_squared") or 0.0),
+            "alpha": float(best.get("best_alpha") or 0.0),
+            "n_obs": int(best.get("n_obs") or 0),
+            "coef": None if coef_val_f is None else {
+                "name": var_label,
+                "value": coef_val_f,
+                "sign": ("sube" if coef_val_f > 0 else "baja")
+            }
+        }
+        cta_var = "¿Quieres ver otra variable o comparar con otro producto?"
+
+        def gen_var():
+            yield f"data: Filtros → país: MX | variable: {var_label} | producto: {term}\n\n"
+            prompt = _prompt_lasso_var(facts_var, hint_cta=cta_var, include_cta=True)
+            rag_buf: list[str] = []
+            for chunk in _stream_no_fin(prompt):
+                try:
+                    content = chunk.split("data:", 1)[1].strip()
+                except Exception:
+                    content = chunk
+                if content and content != "[FIN]":
+                    rag_buf.append(content)
+                yield chunk
+            yield "data: \n\n"
+            try:
+                full_resp = " ".join(rag_buf).strip()
+                vizp = _maybe_viz_prompt(
+                    "lasso_var_influence",
+                    {"country": "MX"},
+                    user_prompt=text,
+                    rag_response=full_resp,
+                )
+            except Exception:
+                vizp = None
+            if vizp:
+                yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+            yield "data: [FIN]\n\n"
+
+        try:
+            remember_session(
+                req.session_id,
+                filters={"country": "MX"},
+                intent="lasso_var_influence",
+                query=text,
+                hits=1 if coef_val_f is not None else 0,
+                mentioned={"country": True},
+            )
+        except Exception:
+            pass
+        return StreamingResponse(gen_var(), media_type="text/event-stream")
 
 
 
