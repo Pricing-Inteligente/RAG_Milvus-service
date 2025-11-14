@@ -97,7 +97,7 @@ def detect_lasso_influence_intent(message: str) -> dict | None:
     m2 = re.search(r"([a-z0-9\-\.\s_]+?)\s+(?:de|en)\s+m[eé]xico\b", text, flags=re.IGNORECASE)
     raw = re.sub(r"\s+", " ", (m2.group(1) if m2 else text)).strip(" ._-")
     # quita artículos y quédate con la última palabra útil
-    tokens = [t for t in re.split(r"\s+", raw) if t not in {"de","en","la","el","las","los"}]
+    tokens = [t for t in re.split(r"\s+", raw) if t not in {"de","en","la","el","las","los","para"}]
     term = tokens[-1] if tokens else raw
 
     return {"intent": "lasso_influence", "by": "product", "term": term}
@@ -147,6 +147,8 @@ def detect_lasso_influence_compare_intent(message: str) -> dict | None:
             # En su defecto, toma lo que sigue al último " de "
             if " de " in tl:
                 tl = tl.rsplit(" de ", 1)[-1]
+            if " para " in tl:
+                tl = tl.rsplit(" para ", 1)[-1]
         # Tokeniza y elimina stopwords
         tokens = [re.sub(r"[^a-z0-9áéíóúñ%/]", "", w) for w in re.split(r"\s+", tl)]
         tokens = [w for w in tokens if w and w not in STOP]
