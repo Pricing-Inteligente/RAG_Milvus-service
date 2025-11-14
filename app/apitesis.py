@@ -98,6 +98,68 @@ def detect_lasso_influence_intent(message: str) -> dict | None:
     return {"intent": "lasso_influence", "by": "product", "term": term}
 
 
+# --- NUEVO: Detección de comparación LASSO entre dos productos/marcas ---
+def detect_lasso_influence_compare_intent(message: str) -> dict | None:
+    """Detecta consultas como 'muestrame descomposicion de precios de arroz y cafe'
+    devolviendo intent 'lasso_influence_compare' con lista de términos.
+    Reglas:
+      - Debe contener alguna palabra clave LASSO.
+      - Debe contener un separador ' y ' o ',' indicando dos términos distintos.
+      - Solo México (bloquea si aparece otro país y no aparece MX).
+    """
+    text_raw = (message or "").strip()
+    text = text_raw.lower()
+    if not any(k in text for k in LASSO_KEYWORDS):
+        return None
+    # País distinto de MX bloquea
+    if _NON_MX_REGEX.search(text) and not _MX_REGEX.search(text):
+        return None  # deja que el detector normal lo bloquee si aplica
+
+    # Normaliza separadores a DOS términos: usa el último separador encontrado
+    if ' y ' in text:
+        parts = [p.strip() for p in text.rsplit(' y ', 1) if p.strip()]
+    else:
+        # Fallback: usar la última coma
+        parts = [p.strip() for p in text.rsplit(',', 1) if p.strip()]
+    if len(parts) != 2:
+        return None
+
+    # Limpieza robusta de cada término (extrae lo posterior a "precios de" o al último "de")
+    STOP = {
+        "muestrame","muéstrame","descomposicion","descomposición","precios","precio","de","del","la","el","los","las",
+        "influencia","impacto","coeficientes","coeficiente","en","mexico","méxico","variables","variable","presentacion","presentación",
+        "producto","productos","marca","marcas"
+    }
+    def _clean_term(t: str) -> str:
+        tl = t.lower().strip()
+        # Quita prefijos comunes "en precios de ..."
+        tl = re.sub(r"\ben\s+precios?\s+de\s+", "", tl)
+        # Si hay un "precios de" explícito, toma lo que sigue
+        m = re.search(r"precios?\s+de\s+(.+)$", tl)
+        if m:
+            tl = m.group(1)
+        else:
+            # En su defecto, toma lo que sigue al último " de "
+            if " de " in tl:
+                tl = tl.rsplit(" de ", 1)[-1]
+        # Tokeniza y elimina stopwords
+        tokens = [re.sub(r"[^a-z0-9áéíóúñ%/]", "", w) for w in re.split(r"\s+", tl)]
+        tokens = [w for w in tokens if w and w not in STOP]
+        if not tokens:
+            # Fallback: última palabra alfanumérica del original
+            m2 = re.findall(r"[a-z0-9áéíóúñ%/]+", t.lower())
+            return m2[-1] if m2 else ""
+        # Prioriza las últimas 1–2 palabras (ej.: "arroz", "leche entera")
+        return " ".join(tokens[-2:])
+
+    term_a = _clean_term(parts[0])
+    term_b = _clean_term(parts[1])
+    if not term_a or not term_b or term_a == term_b:
+        return None
+
+    return {"intent": "lasso_influence_compare", "terms": [term_a, term_b], "country": "MX"}
+
+
 
 
 def _format_lasso_answer(rows: list[dict], by: str, term: str) -> str:
@@ -523,7 +585,7 @@ def sanitize_filters(f: Dict | None) -> Dict:
             out[k] = f[k]
     return out
 
-def _sanitize_resp_excerpt(text: str, max_len: int = 600) -> str:
+def _sanitize_resp_excerpt(text: str, max_len: int = 1000) -> str:
     if not text:
         return ""
     s = re.sub(r"\s+", " ", text).strip()
@@ -806,6 +868,8 @@ def _maybe_viz_prompt(
         # LASSO: usa el mismo esquema genérico basado en la respuesta RAG
         if intent == "lasso_influence":
             return _viz_prompt_from_generic("lasso_influence", filters, user_prompt=user_prompt, rag_response=rag_response)
+        if intent == "lasso_influence_compare":
+            return _viz_prompt_from_generic("lasso_influence_compare", filters, user_prompt=user_prompt, rag_response=rag_response)
     except Exception:
         return None
     return None
@@ -1273,6 +1337,29 @@ def _prompt_lasso_humano(facts: dict, hint_cta: str | None = None, include_cta: 
     return base + f"\nHECHOS(JSON): {json.dumps(facts, ensure_ascii=False)}\nRespuesta:"
 
 
+# --- NUEVO: Prompt para comparación LASSO entre dos productos/marcas ---
+def _prompt_lasso_compare(facts: dict, hint_cta: str | None = None, include_cta: bool = True) -> str:
+    import json
+    base = (
+        "Eres el asistente del SPI. Escribe en español, tono cercano y profesional. "
+        "Devuelve 4–7 frases de TEXTO PLANO (sin markdown, sin viñetas). "
+        "Estructura: 1) saludo amable; 2) contexto breve: explica que se comparan dos modelos LASSO para los productos y qué significan los coeficientes; "
+        "3) respuesta: para cada producto menciona las variables con mayor magnitud, su coeficiente y signo (sube/baja); "
+        "4) destaca las variables comunes y cómo difiere su magnitud entre ambos; "
+        "5) cierra citando R², alfa y n_obs de cada modelo y los 'product_desc' o término si falta, más el retail si está. "
+        "REGLAS CRÍTICAS: Usa ÚNICAMENTE los datos provistos en HECHOS(JSON). Si faltan datos di 'no disponible'. No inventes cifras ni contexto externo. "
+        "No incluyas nombres de personas, ejemplos de CSV, JSON, 'Document', 'Instruction', ni explicaciones meta. "
+        "No menciones países distintos de MX; si no hay país en HECHOS, di 'no disponible'. "
+        "No agregues bibliografía, referencias ni pasos de procedimiento. "
+        "Responde SOLO con el texto final, en un único bloque claro, sin listas, sin títulos, sin código, sin JSON."
+    )
+    if include_cta and hint_cta:
+        base += f" Termina con un único CTA: {hint_cta}"
+    else:
+        base += " No incluyas CTA."
+    return base + f"\nHECHOS(JSON): {json.dumps(facts, ensure_ascii=False)}\nRespuesta:"
+
+
 
 
 
@@ -1727,6 +1814,143 @@ def chat_stream(req: ChatReqStream):
             yield "data: [FIN]\n\n"
         return StreamingResponse(gen_refine(), media_type="text/event-stream")
 
+    # --- DETECCIÓN TEMPRANA: comparación LASSO de dos productos/marcas ---
+    try:
+        early_lasso_cmp = detect_lasso_influence_compare_intent(text)
+    except Exception:
+        early_lasso_cmp = None
+    if early_lasso_cmp and early_lasso_cmp.get("intent") == "lasso_influence_compare":
+        terms = early_lasso_cmp.get("terms") or []
+        if len(terms) != 2:
+            pass  # cae al flujo normal si falla
+        else:
+            term_a, term_b = terms
+            rows_a = query_lasso_models("product", term_a, topk=5) or []
+            if not rows_a:
+                rows_a = query_lasso_models("brand", term_a, topk=5) or []
+            rows_b = query_lasso_models("product", term_b, topk=5) or []
+            if not rows_b:
+                rows_b = query_lasso_models("brand", term_b, topk=5) or []
+
+            if (not rows_a) or (not rows_b):
+                def gen_missing_cmp():
+                    yield "data: Filtros → país: MX | comparación LASSO\n\n"
+                    if not rows_a and not rows_b:
+                        yield "data: No encontré modelos LASSO para ninguno de los dos términos. ¿Intento con otros productos?\n\n"
+                    elif not rows_a:
+                        yield f"data: No encontré modelos LASSO para '{term_a}'. ¿Intento con otro producto para comparar con {term_b}?\n\n"
+                    else:
+                        yield f"data: No encontré modelos LASSO para '{term_b}'. ¿Intento con otro producto para comparar con {term_a}?\n\n"
+                    yield "data: [FIN]\n\n"
+                return StreamingResponse(gen_missing_cmp(), media_type="text/event-stream")
+
+            def _extract_coefs_cmp(row: dict) -> list[dict]:
+                mapping = [
+                    ("coef_inflation_rate_pct_change", "Inflación general (%)"),
+                    ("coef_cambio_dolar_pct_change", "Tipo de cambio USD/MXN (%)"),
+                    ("coef_cpi_pct_change", "CPI / IPC (%)"),
+                    ("coef_interest_rate_pct_change", "Tasa de interés (%)"),
+                    ("coef_gdp_pct_change", "PIB (%)"),
+                    ("coef_producer_prices_pct_change", "Precios al productor (%)"),
+                    ("coef_gini_pct_change", "Índice Gini (%)"),
+                ]
+                out = []
+                for k, label in mapping:
+                    v = row.get(k)
+                    if v is None:
+                        continue
+                    try:
+                        out.append({"name": label, "value": float(v)})
+                    except Exception:
+                        continue
+                out.sort(key=lambda c: abs(c["value"]), reverse=True)
+                return out
+
+            best_a = max(rows_a, key=lambda r: (r.get("r_squared") or 0.0))
+            best_b = max(rows_b, key=lambda r: (r.get("r_squared") or 0.0))
+            coefs_a = _extract_coefs_cmp(best_a)
+            coefs_b = _extract_coefs_cmp(best_b)
+            map_a = {c["name"]: c for c in coefs_a}
+            map_b = {c["name"]: c for c in coefs_b}
+            shared = []
+            for k in sorted(set(map_a) & set(map_b)):
+                shared.append({
+                    "name": k,
+                    "value_a": map_a[k]["value"],
+                    "value_b": map_b[k]["value"],
+                    "sign_a": "sube" if map_a[k]["value"] > 0 else "baja",
+                    "sign_b": "sube" if map_b[k]["value"] > 0 else "baja",
+                })
+
+            facts_cmp = {
+                "type": "lasso_influence_compare",
+                "country": "MX",
+                "terms": terms,
+                "models": [
+                    {
+                        "term": term_a,
+                        "product_desc": best_a.get("nombre") or best_a.get("producto") or term_a,
+                        "brand": best_a.get("marca"),
+                        "retail": best_a.get("retail"),
+                        "r2": float(best_a.get("r_squared") or 0.0),
+                        "alpha": float(best_a.get("best_alpha") or 0.0),
+                        "n_obs": int(best_a.get("n_obs") or 0),
+                        "coefs": coefs_a,
+                    },
+                    {
+                        "term": term_b,
+                        "product_desc": best_b.get("nombre") or best_b.get("producto") or term_b,
+                        "brand": best_b.get("marca"),
+                        "retail": best_b.get("retail"),
+                        "r2": float(best_b.get("r_squared") or 0.0),
+                        "alpha": float(best_b.get("best_alpha") or 0.0),
+                        "n_obs": int(best_b.get("n_obs") or 0),
+                        "coefs": coefs_b,
+                    },
+                ],
+                "shared_coefs": shared,
+            }
+            cta_cmp = "¿Te muestro otro par de productos o profundizamos en uno solo?"
+            def gen_cmp_early():
+                yield "data: Filtros → país: MX | comparación LASSO\n\n"
+                prompt = _prompt_lasso_compare(facts_cmp, hint_cta=cta_cmp, include_cta=True)
+                rag_buf: list[str] = []
+                for chunk in _stream_no_fin(prompt):
+                    try:
+                        content = chunk.split("data:", 1)[1].strip()
+                    except Exception:
+                        content = chunk
+                    if content and content != "[FIN]":
+                        rag_buf.append(content)
+                    yield chunk
+                yield "data: \n\n"
+                try:
+                    full_resp = " ".join(rag_buf).strip()
+                    vizp = _maybe_viz_prompt(
+                        "lasso_influence_compare",
+                        {"country": "MX"},
+                        user_prompt=text,
+                        rag_response=full_resp,
+                    )
+                except Exception:
+                    vizp = None
+                if vizp:
+                    yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+                yield "data: [FIN]\n\n"
+
+            try:
+                remember_session(
+                    req.session_id,
+                    filters={"country": "MX"},
+                    intent="lasso_influence_compare",
+                    query=text,
+                    hits=len(shared),
+                    mentioned={"country": True},
+                )
+            except Exception:
+                pass
+            return StreamingResponse(gen_cmp_early(), media_type="text/event-stream")
+
 
 
         # --- N consultas en un mismo string (separadas por ',' 'y' 'también') ---
@@ -1810,27 +2034,6 @@ def chat_stream(req: ChatReqStream):
                     rows = list_by_filter(f, limit=min(getattr(S, 'chat_list_default', 500), 40)) or []
 
                     yield f"data: [PRODUCTOS] Filtros → {f}\n\n"
-
-                    # 1) Redacción humana primero (usa sub_text de la cláusula)
-                    sub_text = f"precio de {f.get('category')} en {f.get('country')} — resume en 3–5 líneas, tono claro, sin muletillas."
-                    prompt = _prompt_lookup_from_facts(sub_text, facts, ctx)
-                    for chunk in _stream_no_fin(prompt):
-                        yield chunk
-                    yield "data: \n\n"
-
-                    # 2) VIZ_PROMPT (si aplica)
-                    if vizp:
-                        yield f"data: [VIZ_PROMPT] {vizp}\n\n"
-
-                    # 3) Lista compacta (máx 10)
-                    for j, r in enumerate(rows[:10], 1):
-                        yield f"data: {_fmt_row(r, j)}\n\n"
-                    yield "data: \n\n"
-
-
-
-
-
                     # --- Construcción de FACTS (como en lookup) ---
                     facts_filters = dict(f)
                     hits = rows[:min(20, len(rows))]
@@ -1885,21 +2088,20 @@ def chat_stream(req: ChatReqStream):
                         "brand_range": brand_range,
                     }
 
-                    # (Opcional) gráfico si aplica
+                    # Writer humano + VIZ_PROMPT después de tener facts
+                    try:
+                        prompt = _prompt_lookup_from_facts(text, facts, ctx)
+                        for chunk in _stream_no_fin(prompt):
+                            yield chunk
+                        yield "data: \n\n"
+                    except Exception:
+                        yield "data: (error interno en writer de productos multi-subconsulta)\n\n"
                     try:
                         vizp = _maybe_viz_prompt("lookup", f, rows=rows)
-                    except NameError:
-                        vizp = None
-                    if vizp:
-                        yield f"data: [VIZ_PROMPT] {vizp}\n\n"
-
-                    # Redacción humana (lookup)
-                    prompt = _prompt_lookup_from_facts(text, facts, ctx)
-                    for chunk in _stream_no_fin(prompt):
-                        yield chunk
-                    yield "data: \n\n"
-
-                    # Lista compacta (máx 10) para transparencia
+                        if vizp:
+                            yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+                    except Exception:
+                        pass
                     for j, r in enumerate(rows[:10], 1):
                         yield f"data: {_fmt_row(r, j)}\n\n"
 
@@ -1922,6 +2124,151 @@ def chat_stream(req: ChatReqStream):
     # --- LASSO: influencia/descomposición solo para México ---
     # --- LASSO: influencia/descomposición solo para México ---
     lasso_plan = detect_lasso_influence_intent(text)
+    # --- NUEVO: Comparación LASSO entre dos productos ---
+    lasso_cmp_plan = detect_lasso_influence_compare_intent(text)
+    if lasso_cmp_plan and lasso_cmp_plan.get("intent") == "lasso_influence_compare":
+        terms = lasso_cmp_plan.get("terms") or []
+        if len(terms) != 2:
+            # fallback si la detección fue incorrecta
+            pass
+        else:
+            term_a, term_b = terms
+            # Intentamos por producto primero; si no, por marca
+            rows_a = query_lasso_models("product", term_a, topk=5)
+            if not rows_a:
+                rows_a = query_lasso_models("brand", term_a, topk=5)
+            rows_b = query_lasso_models("product", term_b, topk=5)
+            if not rows_b:
+                rows_b = query_lasso_models("brand", term_b, topk=5)
+
+            if (not rows_a) or (not rows_b):
+                def gen_missing():
+                    yield "data: Filtros → país: MX | comparación LASSO\n\n"
+                    if not rows_a and not rows_b:
+                        yield ("data: No encontré modelos LASSO para ninguno de los dos términos. ¿Intento con otros productos?\n\n")
+                    elif not rows_a:
+                        yield (f"data: No encontré modelos LASSO para '{term_a}'. ¿Intento con otro producto para comparar con {term_b}?\n\n")
+                    else:
+                        yield (f"data: No encontré modelos LASSO para '{term_b}'. ¿Intento con otro producto para comparar con {term_a}?\n\n")
+                    yield "data: [FIN]\n\n"
+                return StreamingResponse(gen_missing(), media_type="text/event-stream")
+
+            # Elegimos mejor modelo de cada lado
+            best_a = max(rows_a, key=lambda r: (r.get("r_squared") or 0.0))
+            best_b = max(rows_b, key=lambda r: (r.get("r_squared") or 0.0))
+
+            def _extract_coefs(row: dict) -> list[dict]:
+                mapping = [
+                    ("coef_inflation_rate_pct_change", "Inflación general (%)"),
+                    ("coef_cambio_dolar_pct_change", "Tipo de cambio USD/MXN (%)"),
+                    ("coef_cpi_pct_change", "CPI / IPC (%)"),
+                    ("coef_interest_rate_pct_change", "Tasa de interés (%)"),
+                    ("coef_gdp_pct_change", "PIB (%)"),
+                    ("coef_producer_prices_pct_change", "Precios al productor (%)"),
+                    ("coef_gini_pct_change", "Índice Gini (%)"),
+                ]
+                out = []
+                for key, label in mapping:
+                    v = row.get(key)
+                    if v is not None:
+                        try:
+                            v_f = float(v)
+                        except Exception:
+                            continue
+                        out.append({"name": label, "value": v_f})
+                out.sort(key=lambda c: abs(c["value"]), reverse=True)
+                return out
+
+            coefs_a = _extract_coefs(best_a)
+            coefs_b = _extract_coefs(best_b)
+
+            # Variables comunes (por nombre) presentes en ambos
+            map_a = {c["name"]: c for c in coefs_a}
+            map_b = {c["name"]: c for c in coefs_b}
+            shared = []
+            for k in sorted(set(map_a.keys()) & set(map_b.keys())):
+                shared.append({
+                    "name": k,
+                    "value_a": map_a[k]["value"],
+                    "value_b": map_b[k]["value"],
+                    "sign_a": "sube" if map_a[k]["value"] > 0 else "baja",
+                    "sign_b": "sube" if map_b[k]["value"] > 0 else "baja",
+                })
+
+            facts_cmp = {
+                "type": "lasso_influence_compare",
+                "country": "MX",
+                "terms": terms,
+                "models": [
+                    {
+                        "term": term_a,
+                        "product_desc": best_a.get("nombre") or best_a.get("producto") or term_a,
+                        "brand": best_a.get("marca"),
+                        "retail": best_a.get("retail"),
+                        "r2": float(best_a.get("r_squared") or 0.0),
+                        "alpha": float(best_a.get("best_alpha") or 0.0),
+                        "n_obs": int(best_a.get("n_obs") or 0),
+                        "coefs": coefs_a,
+                    },
+                    {
+                        "term": term_b,
+                        "product_desc": best_b.get("nombre") or best_b.get("producto") or term_b,
+                        "brand": best_b.get("marca"),
+                        "retail": best_b.get("retail"),
+                        "r2": float(best_b.get("r_squared") or 0.0),
+                        "alpha": float(best_b.get("best_alpha") or 0.0),
+                        "n_obs": int(best_b.get("n_obs") or 0),
+                        "coefs": coefs_b,
+                    },
+                ],
+                "shared_coefs": shared,
+            }
+
+            # CTA simple (sin usar _gen_cta para evitar agregar lógica nueva):
+            cta_cmp = "¿Te muestro otro par de productos o profundizamos en uno solo?"
+
+            def gen_cmp_lasso():
+                yield "data: Filtros → país: MX | comparación LASSO\n\n"
+                prompt = _prompt_lasso_compare(facts_cmp, hint_cta=cta_cmp, include_cta=True)
+                rag_buf = []
+                for chunk in _stream_no_fin(prompt):
+                    try:
+                        content = chunk.split("data:", 1)[1].strip()
+                    except Exception:
+                        content = chunk
+                    if content and content != "[FIN]":
+                        rag_buf.append(content)
+                    yield chunk
+                yield "data: \n\n"
+                # VIZ_PROMPT basado en la respuesta RAG comparativa
+                try:
+                    full_resp = " ".join(rag_buf).strip()
+                    vizp = _maybe_viz_prompt(
+                        "lasso_influence_compare",
+                        {"country": "MX"},
+                        user_prompt=text,
+                        rag_response=full_resp,
+                    )
+                except Exception:
+                    vizp = None
+                if vizp:
+                    yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+                yield "data: [FIN]\n\n"
+
+            # Memoria de sesión mínima
+            try:
+                remember_session(
+                    req.session_id,
+                    filters={"country": "MX"},
+                    intent="lasso_influence_compare",
+                    query=text,
+                    hits=len(shared),
+                    mentioned={"country": True},
+                )
+            except Exception:
+                pass
+
+            return StreamingResponse(gen_cmp_lasso(), media_type="text/event-stream")
     if lasso_plan:
         if lasso_plan.get("intent") == "lasso_influence_blocked_non_mx":
             def gen_block():
