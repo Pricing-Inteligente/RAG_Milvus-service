@@ -400,7 +400,7 @@ _MACRO_SYNONYMS = {
     "costo de vida": "cpi",
     "ipc": "cpi",
     "índice de precios al consumidor": "cpi",
-    "indice de precios al consumidor": "cpi",
+        "Limita el cuerpo (antes de listar productos y marcas adicionales) a ~1500 caracteres, priorizando claridad y síntesis. "
     "inflación": "inflation_rate",
     "inflacion": "inflation_rate",
     "tasa de interés": "interest_rate",
@@ -1172,7 +1172,21 @@ class OllamaLLM:
                 chunk = json.loads(line.decode("utf-8"))
                 if "response" in chunk:
                     buf += chunk["response"]
-                    if len(buf) >= min_chars or buf.endswith((" ", ".", ",", ":", ";", "\n")):
+                    flush = False
+                    # Preferir corte en límites naturales
+                    if buf.endswith((" ", ".", ",", ":", ";", "?", "!", "\n")):
+                        flush = True
+                    elif len(buf) >= min_chars:
+                        # Intentar corte suave en el último espacio/nueva línea
+                        last_ws = max(buf.rfind(" "), buf.rfind("\n"))
+                        if last_ws > 0:
+                            out, buf = buf[:last_ws+1], buf[last_ws+1:]
+                            yield f"data: {out}\n\n"
+                            continue
+                        else:
+                            # Sin espacio cercano: esperar hasta el próximo límite
+                            flush = False
+                    if flush:
                         yield f"data: {buf}\n\n"; buf = ""
                 if chunk.get("done"):
                     if buf: yield f"data: {buf}\n\n"
@@ -1221,6 +1235,29 @@ def _stream_no_fin(prompt: str, *, model=None):
             continue
 
         yield s
+
+
+def _llm_blocks(prompt: str, *, model=None) -> list[str]:
+    """Genera texto completo con el modelo (no streaming) y lo separa en bloques lógicos.
+
+    Regla de segmentación: doble salto de línea (\n\n) define el fin de un bloque.
+    Devuelve lista de bloques limpios (sin agregar separadores)."""
+    m = model or llm_chat
+    try:
+        full = m.generate(prompt) or ""
+    except Exception:
+        full = ""
+    # Normalizar saltos (asegurar \n) y dividir por \n\n con posibles espacios
+    parts = re.split(r"\n\s*\n", full.strip()) if full.strip() else []
+    # Limpiar espacios extremos de cada bloque sin tocar espacios internos
+    cleaned = [p.strip() for p in parts if p.strip()]
+    return cleaned
+
+def _emit_blocks_with_separators(blocks: list[str]):
+    """Convierte una lista de bloques en eventos SSE: cada bloque seguido de '~'."""
+    for b in blocks:
+        yield f"data: {b}\n\n"
+        yield "data: ~\n\n"
 
 
 
@@ -1289,12 +1326,15 @@ def _prompt_lookup_from_facts(question: str, facts: dict, ctx: str) -> str:
         "Eres el asistente del *Sistema Pricing Inteligente*, una plataforma de analítica\n"
         "que provee datos de retail para América Latina. Tu rol es analítico, no comercial.\n"
         "Redacta en español, tono natural y claro, variando el saludo y la redacción.\n"
-        "Usa exclusivamente el bloque FACTS y, si te ayuda, algo del CONTEXTO; no inventes.\n"
-        "Incluye el promedio nacional y luego un listado compacto por marca; finalmente cierra con un\n"
-        "resumen breve y una invitación para seguir con filtros o comparaciones.\n"
+        "Formato: TEXTO PLANO en 3–5 párrafos cortos separados por una línea en blanco. Sin markdown ni viñetas.\n"
+        "Usa exclusivamente FACTS (y opcionalmente CONTEXTO); no inventes.\n"
+        "Estructura: (1) saludo + contexto (1 frase); (2) promedio nacional (moneda y n); (3) marcas con promedio y n, máx 5–8 ítems en formato 'Marca: $X (n=Y)' separados por '; '; (4) resumen + CTA final.\n"
         f"Pregunta del usuario: {question}\n"
         f"FACTS(JSON): {facts_json}\n"
         f"CONTEXTO:\n{ctx}\n"
+        "Limita el cuerpo (antes de listar productos y marcas adicionales) a ~1500 caracteres, priorizando claridad y síntesis. "
+        "Si necesitas recortar, preserva: promedio nacional, 5–8 marcas con precio y n, y el CTA final completo (terminado en '?'). "
+        "Nunca cortes una pregunta CTA a la mitad. "
         "Ahora redacta la respuesta completa."
     )
 
@@ -2020,29 +2060,22 @@ def chat_stream(req: ChatReqStream):
             cta_cmp = "¿Te muestro otro par de productos o profundizamos en uno solo?"
             def gen_cmp_early():
                 yield "data: Filtros → país: MX | comparación LASSO\n\n"
-                prompt = _prompt_lasso_compare(facts_cmp, hint_cta=cta_cmp, include_cta=True)
-                rag_buf: list[str] = []
-                for chunk in _stream_no_fin(prompt):
-                    try:
-                        content = chunk.split("data:", 1)[1].strip()
-                    except Exception:
-                        content = chunk
-                    if content and content != "[FIN]":
-                        rag_buf.append(content)
-                    yield chunk
-                yield "data: \n\n"
-                try:
-                    full_resp = " ".join(rag_buf).strip()
-                    vizp = _maybe_viz_prompt(
-                        "lasso_influence_compare",
-                        {"country": "MX"},
-                        user_prompt=text,
-                        rag_response=full_resp,
-                    )
-                except Exception:
-                    vizp = None
+                prompt = _prompt_lasso_compare(facts_cmp, hint_cta=cta_cmp, include_cta=False)
+                blocks = _llm_blocks(prompt)
+                for ev in _emit_blocks_with_separators(blocks):
+                    yield ev
+                full_resp = "\n\n".join(blocks)
+                vizp = _maybe_viz_prompt(
+                    "lasso_influence_compare",
+                    {"country": "MX"},
+                    user_prompt=text,
+                    rag_response=full_resp,
+                )
                 if vizp:
                     yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+                # CTA separado
+                yield f"data: {cta_cmp}\n\n"
+                yield "data: ~\n\n"
                 yield "data: [FIN]\n\n"
 
             try:
@@ -2103,29 +2136,22 @@ def chat_stream(req: ChatReqStream):
 
         def gen_var():
             yield f"data: Filtros → país: MX | variable: {var_label} | producto: {term}\n\n"
-            prompt = _prompt_lasso_var(facts_var, hint_cta=cta_var, include_cta=True)
-            rag_buf: list[str] = []
-            for chunk in _stream_no_fin(prompt):
-                try:
-                    content = chunk.split("data:", 1)[1].strip()
-                except Exception:
-                    content = chunk
-                if content and content != "[FIN]":
-                    rag_buf.append(content)
-                yield chunk
-            yield "data: \n\n"
-            try:
-                full_resp = " ".join(rag_buf).strip()
-                vizp = _maybe_viz_prompt(
-                    "lasso_var_influence",
-                    {"country": "MX"},
-                    user_prompt=text,
-                    rag_response=full_resp,
-                )
-            except Exception:
-                vizp = None
+            prompt = _prompt_lasso_var(facts_var, hint_cta=cta_var, include_cta=False)
+            blocks = _llm_blocks(prompt)
+            for ev in _emit_blocks_with_separators(blocks):
+                yield ev
+            full_resp = "\n\n".join(blocks)
+            vizp = _maybe_viz_prompt(
+                "lasso_var_influence",
+                {"country": "MX"},
+                user_prompt=text,
+                rag_response=full_resp,
+            )
             if vizp:
                 yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+            # CTA separado
+            yield f"data: {cta_var}\n\n"
+            yield "data: ~\n\n"
             yield "data: [FIN]\n\n"
 
         try:
@@ -2278,12 +2304,36 @@ def chat_stream(req: ChatReqStream):
                         "brand_range": brand_range,
                     }
 
-                    # Writer humano + VIZ_PROMPT después de tener facts
+                    # Writer humano + captura del buffer para validar CTA
                     try:
                         prompt = _prompt_lookup_from_facts(text, facts, ctx)
+                        rag_buf = []
                         for chunk in _stream_no_fin(prompt):
+                            # reenviar el chunk tal como llega
+                            try:
+                                content = chunk.split("data:", 1)[1]
+                                if content.startswith(" "):
+                                    content = content[1:]
+                                if content.endswith("\n\n"):
+                                    content = content[:-2]
+                            except Exception:
+                                content = chunk
+                            if content and content not in ("[FIN]",):
+                                rag_buf.append(content)
                             yield chunk
                         yield "data: \n\n"
+                        # Detectar si el texto final incluye un CTA completo (terminado en '?')
+                        try:
+                            full_resp = "".join(rag_buf)
+                            has_cta = bool(re.search(r"\?\s*$", full_resp))
+                            # Si no hay CTA, generamos uno explícito y lo enviamos como evento adicional
+                            if not has_cta:
+                                fallback_cta = _gen_cta("lookup", facts)
+                                yield f"data: {fallback_cta}\n\n"
+                        except Exception:
+                            # Fallback silencioso si algo falla
+                            fallback_cta = _gen_cta("lookup", facts)
+                            yield f"data: {fallback_cta}\n\n"
                     except Exception:
                         yield "data: (error interno en writer de productos multi-subconsulta)\n\n"
                     try:
@@ -2419,30 +2469,22 @@ def chat_stream(req: ChatReqStream):
 
             def gen_cmp_lasso():
                 yield "data: Filtros → país: MX | comparación LASSO\n\n"
-                prompt = _prompt_lasso_compare(facts_cmp, hint_cta=cta_cmp, include_cta=True)
-                rag_buf = []
-                for chunk in _stream_no_fin(prompt):
-                    try:
-                        content = chunk.split("data:", 1)[1].strip()
-                    except Exception:
-                        content = chunk
-                    if content and content != "[FIN]":
-                        rag_buf.append(content)
-                    yield chunk
-                yield "data: \n\n"
-                # VIZ_PROMPT basado en la respuesta RAG comparativa
-                try:
-                    full_resp = " ".join(rag_buf).strip()
-                    vizp = _maybe_viz_prompt(
-                        "lasso_influence_compare",
-                        {"country": "MX"},
-                        user_prompt=text,
-                        rag_response=full_resp,
-                    )
-                except Exception:
-                    vizp = None
+                prompt = _prompt_lasso_compare(facts_cmp, hint_cta=cta_cmp, include_cta=False)
+                blocks = _llm_blocks(prompt)
+                for ev in _emit_blocks_with_separators(blocks):
+                    yield ev
+                full_resp = "\n\n".join(blocks)
+                vizp = _maybe_viz_prompt(
+                    "lasso_influence_compare",
+                    {"country": "MX"},
+                    user_prompt=text,
+                    rag_response=full_resp,
+                )
                 if vizp:
                     yield f"data: [VIZ_PROMPT] {vizp}\n\n"
+                # CTA separado
+                yield f"data: {cta_cmp}\n\n"
+                yield "data: ~\n\n"
                 yield "data: [FIN]\n\n"
 
             # Memoria de sesión mínima
@@ -2519,28 +2561,16 @@ def chat_stream(req: ChatReqStream):
 
             # Writer humano (saludo + contexto LASSO + respuesta). SIN CTA aquí:
             prompt = _prompt_lasso_humano(facts_lasso, hint_cta=None, include_cta=False)
-            rag_buf = []
-            for chunk in _stream_no_fin(prompt):
-                try:
-                    content = chunk.split("data:", 1)[1].strip()
-                except Exception:
-                    content = chunk
-                if content and content != "[FIN]":
-                    rag_buf.append(content)
-                yield chunk
-            yield "data: \n\n"
-
-            # VIZ_PROMPT (basado en la respuesta RAG de LASSO)
-            try:
-                full_resp = " ".join(rag_buf).strip()
-                vizp = _maybe_viz_prompt(
-                    "lasso_influence",
-                    {"country": "MX"},
-                    user_prompt=text,
-                    rag_response=full_resp,
-                )
-            except Exception:
-                vizp = None
+            blocks = _llm_blocks(prompt)
+            for ev in _emit_blocks_with_separators(blocks):
+                yield ev
+            full_resp = "\n\n".join(blocks)
+            vizp = _maybe_viz_prompt(
+                "lasso_influence",
+                {"country": "MX"},
+                user_prompt=text,
+                rag_response=full_resp,
+            )
             if vizp:
                 yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
@@ -2549,6 +2579,7 @@ def chat_stream(req: ChatReqStream):
             yield f"data: Descripción del producto base: {base_desc}\n\n"
 
             # CTA final (1 sola pregunta)
+            yield "data: ~\n\n"
             yield f"data: {cta_lasso}\n\n"
             yield "data: [FIN]\n\n"
 
@@ -2610,7 +2641,11 @@ def chat_stream(req: ChatReqStream):
                 rag_buf = []
                 for chunk in _stream_no_fin(prompt):
                     try:
-                        content = chunk.split("data:", 1)[1].strip()
+                        content = chunk.split("data:", 1)[1]
+                        if content.startswith(" "):
+                            content = content[1:]
+                        if content.endswith("\n\n"):
+                            content = content[:-2]
                     except Exception:
                         content = chunk
                     if content and content != "[FIN]":
@@ -2627,7 +2662,7 @@ def chat_stream(req: ChatReqStream):
 
                 # VIZ_PROMPT (macro rank/topN)
                 try:
-                    full_resp = " ".join(rag_buf).strip()
+                    full_resp = "".join(rag_buf)
                     vizp = _maybe_viz_prompt(
                         "topn",
                         {"country": cs},
@@ -2641,6 +2676,7 @@ def chat_stream(req: ChatReqStream):
                     yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
                 # CTA final (coherente con otros flujos macro)
+                yield "data: ~\n\n"
                 yield f"data: {_gen_cta('macro_rank', facts)}\n\n"
                 yield "data: [FIN]\n\n"
 
@@ -2683,7 +2719,11 @@ def chat_stream(req: ChatReqStream):
                             rag_buf = []
                             for chunk in _stream_no_fin(prompt):
                                 try:
-                                    content = chunk.split("data:", 1)[1].strip()
+                                    content = chunk.split("data:", 1)[1]
+                                    if content.startswith(" "):
+                                        content = content[1:]
+                                    if content.endswith("\n\n"):
+                                        content = content[:-2]
                                 except Exception:
                                     content = chunk
                                 if content and content != "[FIN]":
@@ -2693,7 +2733,7 @@ def chat_stream(req: ChatReqStream):
 
                             # VIZ_PROMPT (lista de variables del país)
                             try:
-                                full_resp = " ".join(rag_buf).strip()
+                                full_resp = "".join(rag_buf)
                                 vizp = _maybe_viz_prompt(
                                     "list",
                                     {"country": countries[0]},
@@ -2724,7 +2764,11 @@ def chat_stream(req: ChatReqStream):
                             rag_buf = []
                             for chunk in _stream_no_fin(prompt):
                                 try:
-                                    content = chunk.split("data:", 1)[1].strip()
+                                    content = chunk.split("data:", 1)[1]
+                                    if content.startswith(" "):
+                                        content = content[1:]
+                                    if content.endswith("\n\n"):
+                                        content = content[:-2]
                                 except Exception:
                                     content = chunk
                                 if content and content != "[FIN]":
@@ -2734,7 +2778,7 @@ def chat_stream(req: ChatReqStream):
 
                             # VIZ_PROMPT (comparación de variable entre países)
                             try:
-                                full_resp = " ".join(rag_buf).strip()
+                                full_resp = "".join(rag_buf)
                                 vizp = _maybe_viz_prompt(
                                     "compare",
                                     {"country": countries},
@@ -2764,7 +2808,11 @@ def chat_stream(req: ChatReqStream):
                             rag_buf = []
                             for chunk in _stream_no_fin(prompt):
                                 try:
-                                    content = chunk.split("data:", 1)[1].strip()
+                                    content = chunk.split("data:", 1)[1]
+                                    if content.startswith(" "):
+                                        content = content[1:]
+                                    if content.endswith("\n\n"):
+                                        content = content[:-2]
                                 except Exception:
                                     content = chunk
                                 if content and content != "[FIN]":
@@ -2774,7 +2822,7 @@ def chat_stream(req: ChatReqStream):
 
                             # VIZ_PROMPT (lookup de variable en un país)
                             try:
-                                full_resp = " ".join(rag_buf).strip()
+                                full_resp = "".join(rag_buf)
                                 vizp = _maybe_viz_prompt(
                                     "lookup",
                                     {"country": countries[0]},
@@ -2801,6 +2849,7 @@ def chat_stream(req: ChatReqStream):
 
                 # CTA final acotado a opciones válidas (intent 'list' de productos)
                 facts_for_cta = {"filters": pf2, "n_listados": len(rows_prod or [])}
+                yield "data: ~\n\n"
                 yield f"data: {_gen_cta('list', facts_for_cta)}\n\n"
                 yield "data: [FIN]\n\n"
 
@@ -2852,7 +2901,11 @@ def chat_stream(req: ChatReqStream):
                     rag_buf = []
                     for chunk in _stream_no_fin(prompt):
                         try:
-                            content = chunk.split("data:", 1)[1].strip()
+                            content = chunk.split("data:", 1)[1]
+                            if content.startswith(" "):
+                                content = content[1:]
+                            if content.endswith("\n\n"):
+                                content = content[:-2]
                         except Exception:
                             content = chunk
                         if content and content != "[FIN]":
@@ -2862,7 +2915,7 @@ def chat_stream(req: ChatReqStream):
 
                     # VIZ_PROMPT (listado macro por país)
                     try:
-                        full_resp = " ".join(rag_buf).strip()
+                        full_resp = "".join(rag_buf)
                         vizp = _maybe_viz_prompt(
                             "list",
                             {"country": countries[0]},
@@ -2879,6 +2932,7 @@ def chat_stream(req: ChatReqStream):
                     for i, r in enumerate(rows[:10], start=1):
                         yield f"data: {_fmt_macro_row(r, i)}\n\n"
 
+                    yield "data: ~\n\n"
                     yield f"data: {_gen_cta('macro_list', facts)}\n\n"
                     yield "data: [FIN]\n\n"
                 MEM.set(req.session_id, {"last_country": countries[0]})
@@ -2909,7 +2963,11 @@ def chat_stream(req: ChatReqStream):
                     rag_buf = []
                     for chunk in _stream_no_fin(prompt):
                         try:
-                            content = chunk.split("data:", 1)[1].strip()
+                            content = chunk.split("data:", 1)[1]
+                            if content.startswith(" "):
+                                content = content[1:]
+                            if content.endswith("\n\n"):
+                                content = content[:-2]
                         except Exception:
                             content = chunk
                         if content and content != "[FIN]":
@@ -2919,7 +2977,7 @@ def chat_stream(req: ChatReqStream):
 
                     # VIZ_PROMPT (comparación multi-país)
                     try:
-                        full_resp = " ".join(rag_buf).strip()
+                        full_resp = "".join(rag_buf)
                         vizp = _maybe_viz_prompt(
                             "compare",
                             {"country": countries},
@@ -2935,6 +2993,7 @@ def chat_stream(req: ChatReqStream):
                     for i, r in enumerate(rows, start=1):
                         yield f"data: {_fmt_macro_row(r, i)}\n\n"
 
+                    yield "data: ~\n\n"
                     yield f"data: {_gen_cta('macro_compare', facts)}\n\n"
                     yield "data: [FIN]\n\n"
                 return StreamingResponse(gen_cmp(), media_type="text/event-stream")
@@ -2961,7 +3020,11 @@ def chat_stream(req: ChatReqStream):
                     rag_buf = []
                     for chunk in _stream_no_fin(prompt):
                         try:
-                            content = chunk.split("data:", 1)[1].strip()
+                            content = chunk.split("data:", 1)[1]
+                            if content.startswith(" "):
+                                content = content[1:]
+                            if content.endswith("\n\n"):
+                                content = content[:-2]
                         except Exception:
                             content = chunk
                         if content and content != "[FIN]":
@@ -2971,7 +3034,7 @@ def chat_stream(req: ChatReqStream):
 
                     # VIZ_PROMPT (lookup de variable)
                     try:
-                        full_resp = " ".join(rag_buf).strip()
+                        full_resp = "".join(rag_buf)
                         vizp = _maybe_viz_prompt(
                             "lookup",
                             {"country": countries[0]},
@@ -2986,6 +3049,7 @@ def chat_stream(req: ChatReqStream):
 
                     yield f"data: {_fmt_macro_row(r)}\n\n"
 
+                    yield "data: ~\n\n"
                     yield f"data: {_gen_cta('macro_lookup', facts)}\n\n"
                     yield "data: [FIN]\n\n"
                 return StreamingResponse(gen_one(), media_type="text/event-stream")
@@ -3496,6 +3560,8 @@ def chat_stream(req: ChatReqStream):
                                 yield f"data: Sugerencia para {code}: prueba sin categoría o con otra similar.\n\n"
                         # CTA al final (acotado a opciones válidas de compare)
                         facts_for_cta = {"category": cat, "countries": countries, "with_data": [c for c, _ in with_data]}
+                        yield "data: ~\n\n"
+                        yield "data: ~\n\n"
                         yield f"data: {_gen_cta('compare', facts_for_cta)}\n\n"
                         yield "data: [FIN]\n\n"
 
@@ -3643,6 +3709,7 @@ def chat_stream(req: ChatReqStream):
 
                     # CTA AUTOGENERADO — al final
                     facts_for_cta = {"category": cat, "countries": countries, "with_data": [c for c, _ in with_data]}
+                    yield "data: ~\n\n"
                     yield f"data: {_gen_cta('compare', facts_for_cta)}\n\n"
                     yield "data: [FIN]\n\n"
 
@@ -3725,6 +3792,7 @@ def chat_stream(req: ChatReqStream):
 
                 # CTA AUTOGENERADO — al final
                 facts_for_cta = {"filters": plan.filters or {}, "hits": len(hits)}
+                yield "data: ~\n\n"
                 yield f"data: {_gen_cta('compare', facts_for_cta)}\n\n"
                 yield "data: [FIN]\n\n"
 
@@ -3941,66 +4009,25 @@ def chat_stream(req: ChatReqStream):
     prompt = _prompt_lookup_from_facts(text, facts, ctx)
 
     def gen_lookup():
-        # VIZ_PROMPT + encabezado (no cuentan para TTFB del LLM)
-        # try:
-        #     vizp = _maybe_viz_prompt("lookup", plan.filters or {}, rows=hits, user_prompt=text)
-        # except NameError:
-        #     vizp = None
-        # if vizp:
-        #     yield f"data: [VIZ_PROMPT] {vizp}\n\n"
-
-        # yield f"data: {_filters_head(plan.filters)}\n\n"
-
-        # # ---- LLM STREAM con TTFB y duración total ----
-
-        # t_llm0 = _now_ms()
-        # first_token_ms = None
-        # total_chars = 0
-        # for chunk in _stream_no_fin(prompt):
-        #     if first_token_ms is None:
-        #         first_token_ms = _now_ms()
-        #     total_chars += len(chunk)
-        #     yield chunk
-        # t_llm1 = _now_ms()
-
-        # _log_perf("chat_stream_lookup_perf", {
-        #     "gen_model": llm_chat.model,
-        #     "planner_ms": planner_ms,
-        #     "retrieve_ms": t_ret1 - t_ret0,
-        #     "ttfb_ms": (first_token_ms - t_llm0) if first_token_ms else None,
-        #     "llm_stream_ms": t_llm1 - t_llm0,
-        #     "total_ms": _now_ms() - t_req0,
-        #     "hits": len(hits),
-        #     "ctx_len_chars": len(ctx),
-        #     "top_k": plan.top_k or getattr(S, "top_k", 5),
-        #     "filters": plan.filters,
-        #     "q": text[:120],
-        #     "sid": req.session_id,
-        # })
-
-        # yield "data: [FIN]\n\n"
-        rag_buf = []
-
         yield f"data: {_filters_head(plan.filters)}\n\n"
-
-        # ---- LLM STREAM con TTFB y duración total ----
-        for chunk in _stream_no_fin(prompt):
-            # chunk ya viene con 'data: ...'; extraer contenido
-            try:
-                content = chunk.split("data:",1)[1].strip()
-            except Exception:
-                content = chunk
-            if content and content != "[FIN]":
-                rag_buf.append(content)
-            yield chunk
-        full_resp = " ".join(rag_buf).strip()
+        blocks = _llm_blocks(prompt)
+        for ev in _emit_blocks_with_separators(blocks):
+            yield ev
+        full_resp = "\n\n".join(blocks)
         vizp = _maybe_viz_prompt("lookup", plan.filters or {}, rows=hits, user_prompt=text, rag_response=full_resp)
         if vizp:
             yield f"data: [VIZ_PROMPT] {vizp}\n\n"
-
-
-        # facts_for_cta = {"filters": plan.filters or {}, "hits": len(hits), "brands_n": len(brands)}
-        # yield f"data: {_gen_cta('lookup', facts_for_cta)}\n\n"
+        # evidencia (lista de productos top_k) como bloque separado
+        if hits:
+            evid_lines = []
+            for h in hits[: plan.top_k or getattr(S, "top_k", 5)]:
+                evid_lines.append(f"{h.get('brand') or '-'}: {h.get('price')} {h.get('currency')} (tienda {h.get('store')} | país {h.get('country')})")
+            yield f"data: {'; '.join(evid_lines)}\n\n"
+            yield "data: ~\n\n"
+        # CTA separado
+        cta_lookup = _gen_cta('lookup', facts)
+        yield f"data: {cta_lookup}\n\n"
+        yield "data: ~\n\n"
         yield "data: [FIN]\n\n"
 
     return StreamingResponse(gen_lookup(), media_type="text/event-stream")
