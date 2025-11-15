@@ -3999,8 +3999,8 @@ def chat_stream(req: ChatReqStream):
             yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
 
-        facts_for_cta = {"filters": plan.filters or {}, "hits": len(hits), "brands_n": len(brands)}
-        yield f"data: {_gen_cta('lookup', facts_for_cta)}\n\n"
+        # facts_for_cta = {"filters": plan.filters or {}, "hits": len(hits), "brands_n": len(brands)}
+        # yield f"data: {_gen_cta('lookup', facts_for_cta)}\n\n"
         yield "data: [FIN]\n\n"
 
     return StreamingResponse(gen_lookup(), media_type="text/event-stream")
