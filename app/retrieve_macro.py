@@ -42,7 +42,7 @@ def _norm(s: str) -> str:
 # Claves canónicas que la app entiende
 CANON_KEYS = ["inflation_rate", "cpi", "interest_rate", "exchange_rate", "gdp", "producer_prices"]
 
-# ES/EN (agrega/ajusta si lo deseas)
+
 SYN: Dict[str, List[str]] = {
     "inflation_rate": [
         "Inflation rate", "inflation rate", "inflacion", "inflación",
@@ -168,9 +168,9 @@ def _embed_query(q: str):
     global _EMBED_MODEL
     try:
         from sentence_transformers import SentenceTransformer
-        import torch, numpy as np  # noqa
+        import torch, numpy as np
     except Exception:
-        return None  # sin librería -> sin fallback vectorial
+        return None
 
     if _EMBED_MODEL is None:
         _EMBED_MODEL = SentenceTransformer(
@@ -278,16 +278,15 @@ def _macro_default_countries() -> list[str]:
     - Si existe la variable de entorno SPI_COUNTRIES="AR,CO,MX", la usa.
     - Si no, usa un set por defecto pensado para LATAM.
     """
-    # 1) settings.S (opcional; no falla si no está)
     try:
-        from settings import S  # opcional
+        from settings import S
         cs = getattr(S, "countries", None)
         if cs:
             return [str(c).upper() for c in cs if isinstance(c, str) and c.strip()]
     except Exception:
         pass
 
-    # 2) Variable de entorno (opcional)
+
     import os
     env = os.getenv("SPI_COUNTRIES")
     if env:

@@ -1,15 +1,14 @@
 # retrieve_lasso.py
 from typing import List, Dict
 try:
-    # Literal viene en typing (3.8+) o en typing_extensions según el entorno
     from typing import Literal
-except Exception:  # pragma: no cover
-    from typing_extensions import Literal  # type: ignore
+except Exception:
+    from typing_extensions import Literal
 
 import os
 from pymilvus import connections, Collection
 
-# Nombre de la colección (configurable por .env)
+
 LASSO_COLLECTION = os.getenv("LASSO_COLLECTION", "lasso_models")
 MILVUS_HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
 MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
@@ -21,7 +20,6 @@ def _connect_if_needed():
     Respeta las mismas variables de entorno que usa el resto del proyecto.
     """
     try:
-        # Si ya existe la conexión, no hace nada.
         connections.get_connection_addr(MILVUS_ALIAS)
     except Exception:
         connections.connect(MILVUS_ALIAS, host=MILVUS_HOST, port=MILVUS_PORT)
@@ -37,7 +35,6 @@ LASSO_OUTPUT_FIELDS = [
     "coef_inflation_rate_pct_change",
     "coef_interest_rate_pct_change",
     "coef_producer_prices_pct_change",
-    # no es necesario devolver canonical_text; lo usamos solo para filtrar en el fallback
 ]
 
 def _safe_term(term: str) -> str:
@@ -65,7 +62,6 @@ def query_lasso_models(by: Literal["brand", "product"], term: str, topk: int = 5
     try:
         col.load()
     except Exception:
-        # si ya está Loaded o no es necesario, ignoramos
         pass
 
     field = "marca" if by == "brand" else "producto"

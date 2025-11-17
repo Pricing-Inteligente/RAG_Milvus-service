@@ -47,7 +47,7 @@ NON_MX_COUNTRIES = {
     "argentina","brasil","brasil","br","chile","cl","colombia","co","peru","pe",
     "panama","pa","uruguay","uy","paraguay","py","ecuador","ec","bolivia","bo",
     "venezuela","ve","guatemala","gt","costa rica","cr","honduras","hn","nicaragua","ni",
-    "el salvador","sv","mexico df","méxico df"  # <- no bloquea, solo ejemplos de texto
+    "el salvador","sv","mexico df","méxico df"
 }
 
 
@@ -120,7 +120,6 @@ def detect_lasso_influence_compare_intent(message: str) -> dict | None:
     if _NON_MX_REGEX.search(text) and not _MX_REGEX.search(text):
         return None  # deja que el detector normal lo bloquee si aplica
 
-    # Normaliza separadores a DOS términos: usa el último separador encontrado
     if ' y ' in text:
         parts = [p.strip() for p in text.rsplit(' y ', 1) if p.strip()]
     else:
@@ -167,7 +166,7 @@ def detect_lasso_influence_compare_intent(message: str) -> dict | None:
     return {"intent": "lasso_influence_compare", "terms": [term_a, term_b], "country": "MX"}
 
 
-# --- NUEVO: Detección de influencia de UNA variable específica sobre un producto/marca ---
+# --- Detección de influencia de UNA variable específica sobre un producto/marca ---
 _LASSO_VAR_ALIASES = [
     ("coef_inflation_rate_pct_change", ["inflacion", "inflación", "inflation", "ipc general"]),
     ("coef_cambio_dolar_pct_change", ["tipo de cambio", "dolar", "dólar", "usd", "tc", "usd/mxn"]),
@@ -479,7 +478,7 @@ def _normalize_plan_filters(filters: dict | None, text_for_fallback: str) -> dic
         if clist: f["country"] = clist
         else:     f.pop("country", None)
 
-    # ⚠️ clave: si huele a macro, NO infieras categoría desde el texto
+    # si macro - NO infieras categoría desde el texto
     if _extract_macros(text_for_fallback) or _guess_macro(text_for_fallback):
         if not f.get("category"):
             f.pop("category", None)
@@ -1056,7 +1055,6 @@ app = FastAPI(title="RAG Pricing API", version="1.8.0")
 @app.on_event("startup")
 async def _warmup():
     try:
-        # 1) Cargar colecciones Milvus
         from pymilvus import Collection
         from settings import get_settings
         S = get_settings()
@@ -1083,7 +1081,6 @@ async def _warmup():
         except Exception:
             pass
     except Exception:
-        # no romper inicio por warmup
         pass
 
 
@@ -1091,15 +1088,14 @@ async def _warmup():
 
 @app.options("/chat/stream")
 def options_chat_stream():
-    # 204 vacío: el CORSMiddleware añadirá los headers CORS permitidos
     return Response(status_code=204)
 
 
 
 origins = [
     "http://localhost:5173",  # frontend local
-    "http://127.0.0.1:5173",  # a veces Vite usa 127.0.0.1
-    "http://localhost:8080",  # Lovable local
+    "http://127.0.0.1:5173",
+    "http://localhost:8080",
     "http://localhost:8081",
     "http://127.0.0.1:8081",
 ]
@@ -1339,10 +1335,6 @@ def _prompt_lookup_from_facts(question: str, facts: dict, ctx: str) -> str:
     )
 
 def _cta_options(intent: str, facts: dict) -> list[str]:
-    """
-    Devuelve SOLO opciones compatibles con el sistema para cada intent.
-    No inventes opciones aquí: todo lo listado debe existir.
-    """
     var = facts.get("variable") or (facts.get("variables") or [None])[0]
     country = facts.get("country")
     base_var = "esta variable" if var else "una variable"
@@ -1380,7 +1372,7 @@ def _cta_options(intent: str, facts: dict) -> list[str]:
             "¿Quieres comparar otra categoría?",
         ]
 
-    # === NUEVO: CTA para influencia LASSO ===
+    # === CTA para influencia LASSO ===
     if intent == "lasso_influence":
         return [
             "¿Quieres comparar la influencia con otra marca o producto?",
@@ -1465,7 +1457,7 @@ def _prompt_lasso_humano(facts: dict, hint_cta: str | None = None, include_cta: 
     return base + f"\nHECHOS(JSON): {json.dumps(facts, ensure_ascii=False)}\nRespuesta:"
 
 
-# --- NUEVO: Prompt para comparación LASSO entre dos productos/marcas ---
+# --- Prompt para comparación LASSO entre dos productos/marcas ---
 def _prompt_lasso_compare(facts: dict, hint_cta: str | None = None, include_cta: bool = True) -> str:
     import json
     base = (
@@ -1488,7 +1480,7 @@ def _prompt_lasso_compare(facts: dict, hint_cta: str | None = None, include_cta:
     return base + f"\nHECHOS(JSON): {json.dumps(facts, ensure_ascii=False)}\nRespuesta:"
 
 
-# --- NUEVO: Prompt para influencia de UNA variable sobre un producto ---
+# --- Prompt para influencia de UNA variable sobre un producto ---
 def _prompt_lasso_var(facts: dict, hint_cta: str | None = None, include_cta: bool = True) -> str:
     import json
     base = (
@@ -1868,7 +1860,7 @@ def chat_stream(req: ChatReqStream):
 
 
 
-        # (nuevo) Diagnóstico de "sin resultados"
+        # Diagnóstico de "sin resultados"
     def _diagnose_no_results(intent: str, *, plan=None, text:str="", macros=None, rows=None, hits=None, agg=None, filters: dict | None = None) -> str:
         f = (filters or (plan.filters if plan else {}) or {})
         countries = f.get("country")
@@ -1908,7 +1900,7 @@ def chat_stream(req: ChatReqStream):
         # 5) genérico
         return "no hubo coincidencias con esa combinación de filtros. ¿Relajo filtros (sin tienda) o cambiamos de categoría/país?"
 
-    # (nuevo) SSE de “sin datos” con razón + contexto + CTA + FIN
+    # SSE de “sin datos” con razón + contexto + CTA + FIN
     def _sse_no_data_ex(reason: str, filters: dict | None):
         head = _filters_head(filters or {})
         yield f"data: Hola. No pude traer resultados porque {reason}\n\n"
@@ -2361,10 +2353,10 @@ def chat_stream(req: ChatReqStream):
         return StreamingResponse(gen_multi(), media_type="text/event-stream")
 
 
-    # --- LASSO: influencia/descomposición solo para México ---
+
     # --- LASSO: influencia/descomposición solo para México ---
     lasso_plan = detect_lasso_influence_intent(text)
-    # --- NUEVO: Comparación LASSO entre dos productos ---
+    # --- Comparación LASSO entre dos productos ---
     lasso_cmp_plan = detect_lasso_influence_compare_intent(text)
     if lasso_cmp_plan and lasso_cmp_plan.get("intent") == "lasso_influence_compare":
         terms = lasso_cmp_plan.get("terms") or []
@@ -2574,7 +2566,6 @@ def chat_stream(req: ChatReqStream):
             if vizp:
                 yield f"data: [VIZ_PROMPT] {vizp}\n\n"
 
-            # Etiqueta de “Descripción del producto” (antes decía 'Modelo')
             base_desc = best.get("nombre") or best.get("producto") or best.get("marca") or "-"
             yield f"data: Descripción del producto base: {base_desc}\n\n"
 
@@ -3085,7 +3076,6 @@ def chat_stream(req: ChatReqStream):
                 top_k=getattr(S, "top_k", 5),
                 limit=min(max(req.limit or 100, 1), getattr(S, "chat_list_max", 1000)),
             )
-            # y deja que el flujo continúe con este plan (no devuelvas aquí)
 
 
 
@@ -3095,13 +3085,13 @@ def chat_stream(req: ChatReqStream):
     force_trend = _is_trend_query(text)
 
     # 1) Planner LLM (si aplica) + heurística directa  (TIMED)
-    planner_ms = None                     # ← NUEVO
-    t_pl0 = _now_ms()                     # ← NUEVO
+    planner_ms = None
+    t_pl0 = _now_ms()
     try:
         if 'plan' not in locals() or plan is None:
             plan = _plan_from_llm(text)
     finally:
-        planner_ms = _now_ms() - t_pl0    # ← NUEVO
+        planner_ms = _now_ms() - t_pl0
 
     heur_now = _guess_filters(text)  # SOLO alias explícitos del turno
     base_filters = plan.filters if plan else heur_now
@@ -3152,7 +3142,7 @@ def chat_stream(req: ChatReqStream):
     elif force_trend:
         plan.intent = "trend"
 
-    # >>> BLOQUE NUEVO: si es una consulta genérica de "precios de productos", listar por país
+    # >>> Si es una consulta genérica de "precios de productos", listar por país
     def _is_generic_prices(nt: str, *, has_category: bool) -> bool:
         """
         Considera 'genérico' solo si NO hay categoría detectada explícitamente
@@ -3175,7 +3165,6 @@ def chat_stream(req: ChatReqStream):
         if plan.filters:
             for k in ("brand", "store"):
                 plan.filters.pop(k, None)
-    # <<< FIN BLOQUE NUEVO
 
 
     # Log pre-ejecución (plan + filtros)
@@ -3189,7 +3178,6 @@ def chat_stream(req: ChatReqStream):
                               "store": "store" in heur_now},
     })
 
-    # <-- pega aquí
     mentioned = dict(getattr(plan, "explicit_mentions", {}) or {}) or _detect_mentions_from_text(text)
 
 
@@ -3409,7 +3397,6 @@ def chat_stream(req: ChatReqStream):
      # ---- TREND → tendencia últimos 30 días (o rango corto) ----
     if plan.intent == "trend":
         try:
-            # puedes extraer días del texto si quieres; por ahora 30
             days = 30
             ser = series_prices(plan.filters or None, days=days) or []
         except Exception as e:
@@ -3740,7 +3727,7 @@ def chat_stream(req: ChatReqStream):
                 reason = _diagnose_no_results("compare", plan=plan, text=text, hits=hits, filters=plan.filters)
                 return StreamingResponse(_sse_no_data_ex(reason, plan.filters), media_type="text/event-stream")
 
-            # Persistimos aquí (NO hay with_data en este camino)
+
             remember_session(
                 req.session_id,
                 filters=plan.filters,
@@ -3902,7 +3889,7 @@ def chat_stream(req: ChatReqStream):
             h2 = retrieve(effective_q, f2)[: plan.top_k or getattr(S, "top_k", 5)]
             if h2:
                 hits = h2
-                facts_filters = f2   # <-- ¡clave! usa estos filtros para calcular facts
+                facts_filters = f2
 
         t_ret1 = _now_ms()
 
@@ -3936,7 +3923,6 @@ def chat_stream(req: ChatReqStream):
 
     ctx = _build_ctx(hits, plan.top_k or getattr(S, "top_k", 5))
 
-    # --- HECHOS desde la base para que el LLM redacte ---
     # --- HECHOS desde la base para que el LLM redacte ---
     base_filters = dict(facts_filters)
     base_filters.pop("store", None)  # promedio nacional sin tienda

@@ -15,7 +15,7 @@ def _norm(s: str) -> str:
 
 def _extract_json(text: str) -> Optional[dict]:
     m = re.search(r"\{.*\}", text or "", re.S)
-    if not m: 
+    if not m:
         return None
     raw = m.group(0)
     try:
@@ -50,7 +50,7 @@ ALIAS_TO_CANON = {
     "queso": "queso_blando",
     "leche en polvo": "leche",
     "leche polvo": "leche",
-    "leche": "leche_liquida",  # regla clave
+    "leche": "leche_liquida",
 }
 
 COUNTRY_MAP = {

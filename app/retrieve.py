@@ -546,7 +546,6 @@ def retrieve(query: str, filters: Optional[Dict]=None) -> List[Dict]:
     if filters is None:
         filters = {}
 
-    # ⚠️ No infieras categoría cuando la consulta sea genérica (“precios” + “productos”)
     ntq = _norm(query)
     is_generic = (("precio" in ntq or "precios" in ntq) and ("producto" in ntq or "productos" in ntq))
 

@@ -91,7 +91,7 @@ def ensure_collection(dim: int = 768) -> Collection:
     col.create_index(field_name="embedding", index_params={
         "index_type": "HNSW", "metric_type": "IP", "params": {"M": 32, "efConstruction": 200}
     })
-    # Índices escalares (opcionales)
+
     try:
         col.create_index(field_name="pais", index_params={"index_type":"INVERTED","metric_type":"L2","params":{}})
     except Exception:

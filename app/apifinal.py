@@ -220,93 +220,68 @@ def _fmt_macro_row(r: dict, idx: int | None = None) -> str:
 
 
 
-# ALIAS: categoría canónica (según Milvus)
-# las claves del dict son las CATEGORÍAS que existen en Milvus,
-# y los valores son las listas de ALIAS que pueden escribir los usuarios.
 CAT_ALIASES = {
-    # arroz
     "arroz": ["arroz", "rice"],
 
-    # pan de molde
     "pan_de_molde": [
         "pan de molde", "pan tajado", "pan lactal", "pan de caja",
         "pan sandwich", "pan sándwich", "pan bimbo"
     ],
 
-    # leche líquida
     "leche_liquida": [
         "leche", "leches", "leche liquida", "leche líquida",
         "leche uht", "leche entera", "leche descremada", "leche semidescremada"
     ],
 
-    # leche
     "leche": ["leche en polvo", "leche polvo"],
 
-    # pasta seca
     "pasta_seca": ["pasta", "espagueti", "espaguetis", "spaghetti", "fideos", "macarrones"],
 
-    # azúcar
     "azucar": ["azucar", "azúcar", "sugar"],
 
-    # café (genérico) y molido
     "cafe": ["cafe", "café", "cafe instantaneo", "café instantáneo"],
     "cafe_molido": ["cafe molido", "café molido", "cafe tostado y molido", "café tostado y molido"],
 
-    # aceite vegetal
     "aceite_vegetal": [
         "aceite", "aceite vegetal", "aceite de cocina",
         "aceite de girasol", "aceite de soya", "aceite de soja",
         "aceite de maiz", "aceite de maíz"
     ],
 
-    # huevo
     "huevo": ["huevo", "huevos", "docena de huevos"],
 
-    # pollo entero
     "pollo_entero": ["pollo", "pollo entero", "pollo fresco", "pollo asadero"],
 
-    # refrescos de cola
     "refrescos_de_cola": [
         "refresco de cola", "refrescos de cola", "gaseosa", "gaseosas",
         "gaseosa de cola", "soda", "cola", "coca cola", "coca-cola",
         "refrigerio", "refrigerios"
     ],
 
-    # papa
     "papa": ["papa", "papas", "patata", "patatas"],
 
-    # frijol
     "frijol": ["frijol", "frijoles", "poroto", "porotos", "alubia", "alubias"],
 
-    # harina de trigo
     "harina_de_trigo": ["harina", "harina de trigo"],
 
-    # cerveza
     "cerveza": ["cerveza", "beer"],
 
-    # queso blando
     "queso_blando": [
         "queso", "quesos", "queso fresco", "queso doble crema",
         "queso mozarella", "queso mozzarella"
     ],
 
-    # atún (genérico) y en lata
     "atun": ["atun", "atún"],
     "atun_en_lata": ["atun en lata", "atún en lata", "lata de atun", "lata de atún"],
 
-    # tomate
     "tomate": ["tomate", "jitomate", "tomates"],
 
-    # cebolla
     "cebolla": ["cebolla", "cebollas", "onion"],
 
-    # manzana
     "manzana": ["manzana", "manzanas", "apple"],
 
-    # banano
     "banano": ["banano", "bananos", "banana", "bananas"],
 
-    # pan
     "pan": ["pan", "pan frances", "pan francés", "bollos"],
 }
 
@@ -603,39 +578,7 @@ def _viz_prompt_from_generic(
     excerpt = _sanitize_resp_excerpt(base)
     return f'creame la mejor forma de visualizar este reporte analítico, usando el tipo de grafica que consideres apropiado: "{excerpt}".'
 
-# def _maybe_viz_prompt(
-#     intent: str,
-#     filters: Dict,
-#     *,
-#     rows: List[Dict] | None = None,
-#     agg: Dict | None = None,
-#     group_by: str | None = None,
-#     series: List[Dict] | None = None,
-#     user_prompt: str | None = None,
-# ) -> str | None:
-#     try:
-#         if intent in ("lookup", "list", "compare") and rows:
-#             return _viz_prompt_from_rows(rows, filters, user_prompt=user_prompt)
-#         if intent == "aggregate" and agg and (agg.get("groups") or []):
-#             gb = group_by or "category"
-#             return _viz_prompt_from_agg(agg, filters, group_by=gb, user_prompt=user_prompt)
 
-#                 # TOPN: construir barras con los top N (usa "rows")
-#         if intent == "topn" and rows:
-#             up = (user_prompt or _viz_title(filters, "lookup") or "").strip()
-#             upq = up.replace("'", "\\'")
-#             return f"creame la mejor visualizacion para responder la peticion '{upq}'."
-
-#         # TREND: línea temporal con serie (usa "series")
-#         if intent == "trend" and series:
-#             up = (user_prompt or "tendencia de precios")
-#             upq = up.replace("'", "\\'")
-#             return f"creame la mejor visualizacion para responder la peticion '{upq}'."
-
-
-#     except Exception:
-#         return None
-#     return None
 
 def _maybe_viz_prompt(
     intent: str,
@@ -754,7 +697,6 @@ async def _warmup():
             Collection(getattr(S, "milvus_collection", "products_latam")).load()
         except Exception:
             pass
-        # Macro (si está en el mismo proceso)
         try:
             from retrieve_macro import _milvus_collection as _macro_coll
             _macro_coll().load()
@@ -773,7 +715,6 @@ async def _warmup():
         except Exception:
             pass
     except Exception:
-        # no romper inicio por warmup
         pass
 
 
@@ -781,15 +722,14 @@ async def _warmup():
 
 @app.options("/chat/stream")
 def options_chat_stream():
-    # 204 vacío: el CORSMiddleware añadirá los headers CORS permitidos
     return Response(status_code=204)
 
 
 
 origins = [
     "http://localhost:5173",  # frontend local
-    "http://127.0.0.1:5173",  # a veces Vite usa 127.0.0.1
-    "http://localhost:8080",  # Lovable local
+    "http://127.0.0.1:5173",
+    "http://localhost:8080",  # frontend local alternativo
     "http://localhost:8081",
     "http://127.0.0.1:8081",
 ]
@@ -889,7 +829,6 @@ def _stream_no_fin(prompt: str, *, model=None):
         if s.strip() == "data: [FIN]":
             continue
 
-        # Ya viene con 'data: ...\n\n'
         yield s
 
 
@@ -1076,7 +1015,7 @@ def _is_trend_query(text: str) -> bool:
     return any(k in t for k in ["tendencia", "últimos", "ultimo", "último", "evolución", "histor", "serie"])
 
 
-# --- STUB opcional: reemplázalo por tu implementación real ---
+
 def series_prices(filters: dict | None, days: int = 30) -> list[dict]:
     """
     Devuelve [{ "date": "YYYY-MM-DD", "value": float, "currency": "COP" }].
@@ -1167,7 +1106,7 @@ def _guess_filters(text: str) -> Dict:
     return f
 
 
-# --- EXTRA: detectar N países mencionados (hasta 10) en orden de mención ---
+# --- detectar N países mencionados (hasta 10) en orden de mención ---
 def _extract_countries(text: str, max_n: int = 10) -> list[str]:
     """
     Devuelve códigos ISO2 según NCOUNTRIES (alias normalizados → código),
@@ -1286,7 +1225,6 @@ def chat_stream(req: ChatReqStream):
 
 
 
-        # (nuevo) Diagnóstico de "sin resultados"
     def _diagnose_no_results(intent: str, *, plan=None, text:str="", macros=None, rows=None, hits=None, agg=None) -> str:
         f = (plan.filters if plan else {}) or {}
         countries = f.get("country")
@@ -1325,7 +1263,7 @@ def chat_stream(req: ChatReqStream):
         # 5) genérico
         return "no hubo coincidencias con esa combinación de filtros. ¿Relajo filtros (sin tienda) o cambiamos de categoría/país?"
 
-    # (nuevo) SSE de “sin datos” con razón + contexto + CTA + FIN
+    # SSE de “sin datos” con razón + contexto + CTA + FIN
     def _sse_no_data_ex(reason: str, filters: dict | None):
         head = _filters_head(filters or {})
         yield f"data: Hola. No pude traer resultados porque {reason}\n\n"
@@ -1712,15 +1650,15 @@ def chat_stream(req: ChatReqStream):
     force_trend = _is_trend_query(text)
 
     # 1) Planner LLM (si aplica) + heurística directa  (TIMED)
-    planner_ms = None                     # ← NUEVO
-    t_pl0 = _now_ms()                     # ← NUEVO
+    planner_ms = None
+    t_pl0 = _now_ms()
     try:
         if 'plan' not in locals() or plan is None:
             plan = _plan_from_llm(text)
     finally:
         planner_ms = _now_ms() - t_pl0    # ← NUEVO
 
-    heur_now = _guess_filters(text)  # SOLO alias explícitos del turno
+    heur_now = _guess_filters(text)
     base_filters = plan.filters if plan else heur_now
 
     # 2) Filtros inteligentes (base + LLM + semántico si falta category)
@@ -1769,7 +1707,7 @@ def chat_stream(req: ChatReqStream):
     elif force_trend:
         plan.intent = "trend"
 
-    # >>> BLOQUE NUEVO: si es una consulta genérica de "precios de productos", listar por país
+    # >>> Si es una consulta genérica de "precios de productos", listar por país
     def _is_generic_prices(nt: str, *, has_category: bool) -> bool:
         """
         Considera 'genérico' solo si NO hay categoría detectada explícitamente
@@ -1791,7 +1729,7 @@ def chat_stream(req: ChatReqStream):
         if plan.filters:
             for k in ("brand", "store"):
                 plan.filters.pop(k, None)
-    # <<< FIN BLOQUE NUEVO
+
 
 
     # Log pre-ejecución (plan + filtros)
@@ -2017,7 +1955,6 @@ def chat_stream(req: ChatReqStream):
      # ---- TREND → tendencia últimos 30 días (o rango corto) ----
     if plan.intent == "trend":
         try:
-            # puedes extraer días del texto si quieres; por ahora 30
             days = 30
             ser = series_prices(plan.filters or None, days=days) or []
         except Exception as e:
@@ -2094,7 +2031,7 @@ def chat_stream(req: ChatReqStream):
             countries = _extract_countries(text, max_n=10)
             cat = (plan.filters or {}).get("category")
 
-            # --- NUEVO: inferir categoría si falta (sinónimos -> semántico) ---
+            # --- Inferir categoría si falta (sinónimos -> semántico) ---
             if not cat:
                 cat = _canonicalize_category(text)
 
@@ -2159,7 +2096,7 @@ def chat_stream(req: ChatReqStream):
                     return StreamingResponse(gen_hint(), media_type="text/event-stream")
 
 
-                # --- Si quieres redacción humana, usa LLM con "hechos" agregados
+
                 if getattr(S, "compare_llm", True):
                     # preparar hechos por país
                     facts = {"category": cat, "countries": []}
@@ -2233,7 +2170,7 @@ def chat_stream(req: ChatReqStream):
                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
                     )
 
-                # --- Respaldo determinista (sin LLM)
+
                 def gen():
                     try:
                         groups = []
@@ -2375,7 +2312,6 @@ def chat_stream(req: ChatReqStream):
 
 
         def gen():
-            # VIZ_PROMPT (no cuenta para TTFB del LLM)
             try:
                 vizp = _maybe_viz_prompt(
                     "aggregate",
@@ -2436,7 +2372,7 @@ def chat_stream(req: ChatReqStream):
             h2 = retrieve(effective_q, f2)[: plan.top_k or getattr(S, "top_k", 5)]
             if h2:
                 hits = h2
-                facts_filters = f2   # <-- ¡clave! usa estos filtros para calcular facts
+                facts_filters = f2
 
         t_ret1 = _now_ms()
 
@@ -2470,7 +2406,6 @@ def chat_stream(req: ChatReqStream):
 
     ctx = _build_ctx(hits, plan.top_k or getattr(S, "top_k", 5))
 
-    # --- HECHOS desde la base para que el LLM redacte ---
     # --- HECHOS desde la base para que el LLM redacte ---
     base_filters = dict(facts_filters)
     base_filters.pop("store", None)  # promedio nacional sin tienda
